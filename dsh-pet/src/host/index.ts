@@ -206,7 +206,10 @@ function sendFile(res: ServerResponse, file: string, contentType: string): void 
 // 不 import src/shared —— DSH 单文件加载约束）。本文件不再保留任何配置逻辑，只消费成品返回值。
 
 /** 该宠物是否参与桌面模式（Electron 透明窗） */
-const isDesktopVisible = (display: unknown): boolean => display === 'desktop' || display === 'both';
+const isDesktopVisible = (display: unknown): boolean => display !== 'none'; // 桌面版 fork：web/both 也归桌面
+
+/** 桌面版 fork：桌面最多一只宠物 */
+const MAX_DESKTOP_PETS = 1;
 
 /** 发送 JSON 响应（headers 可选：如 no-cache 触发计数） */
 function sendJson(res: ServerResponse, status: number, obj: unknown, headers: Record<string, string> = {}): void {
@@ -620,6 +623,7 @@ export function apply(ctx: any): void {
     try {
       return effectivePetList()
         .filter((p) => isDesktopVisible(p.display))
+        .slice(0, MAX_DESKTOP_PETS)
         .map((p) => ({ id: String(p.id), size: Number(p.size) }));
     } catch {
       return [];
@@ -843,8 +847,17 @@ export function apply(ctx: any): void {
               obj: { error: 'user config is unparsable', needConfirm: true, userFile: userConfigPath },
             };
           }
-          await mkdir(userRoot, { recursive: true });
-          await writeFile(userConfigPath, JSON.stringify(clean, null, 2), 'utf8');
+          try {
+            await mkdir(userRoot, { recursive: true });
+            await writeFile(userConfigPath, JSON.stringify(clean, null, 2), 'utf8');
+          } catch (e) {
+            // 桌面版 fork：写盘失败（权限/占用）如实报 500，别被外层 catch 误报成「invalid JSON body」
+            return {
+              kind: 'json',
+              status: 500,
+              obj: { error: 'failed to write user config: ' + (e instanceof Error ? e.message : String(e)) },
+            };
+          }
           void syncDesktop(); // display/size 等可能变化：重解析桌面宠物并重启 Helper（异步，不阻塞保存响应）
           // 响应体 = 保存后的**成品聚合**（与 GET /config 同一份，字段已填满）：
           // 设置页把它直接交给容器的 flattenConfigPets 拍平渲染——客户端的条目级字段

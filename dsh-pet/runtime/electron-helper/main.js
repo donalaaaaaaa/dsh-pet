@@ -73,6 +73,24 @@ const DPI_PROBE = process.env.DSH_PET_DPI_PROBE === '1';
 /** 探测进程的输出标记（父进程按它抓值） */
 const DPI_MARK = 'dsh-pet-primary-scale:';
 
+// ---------- 桌面版 fork：全局单实例（同一系统用户只允许一个桌宠 helper） ----------
+// 多个宿主（DSH 桌面版 + dsh web / standalone / 多个 profile）或插件热重载时旧 helper 尚未退出，
+// 都会各拉一个 helper → 桌面出现两只。用 Electron 单实例锁（按 userData = dsh-pet-electron-helper）
+// 先到先得；抢不到锁的以退出码 75（EX_TEMPFAIL）退出，宿主侧 HelperProcess 识别该码后
+// 不计崩溃、隔几秒重试——旧实例真正退出后自动接管，保证桌面永远恰好一只。
+// DPI 探测子进程不建窗口、只打印一次就退，不参与抢锁（否则会被主实例的锁拦下）。
+const SINGLE_INSTANCE_EXIT_CODE = 75;
+if (!DPI_PROBE && process.env.DSH_PET_ALLOW_MULTI_INSTANCE !== '1') {
+  if (!app.requestSingleInstanceLock()) {
+    try {
+      process.stderr.write('[dsh-pet] another desktop pet helper is already running; exiting (75)\n');
+    } catch {
+      /* 管道已断：静默 */
+    }
+    app.exit(SINGLE_INSTANCE_EXIT_CODE);
+  }
+}
+
 // ---------- 宿主存活（issue #56）：管道断开 / 父进程消失 → 自己退出 ----------
 //
 // 【为什么必须自己退】宿主退出后，它在 helper 的 stdout/stderr 上握着的管道读端一起关闭；helper

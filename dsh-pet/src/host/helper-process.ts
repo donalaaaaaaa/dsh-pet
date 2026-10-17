@@ -283,6 +283,11 @@ export function helperSpawnEnv(hostPid: number, extra?: Record<string, string | 
   return env;
 }
 
+/** 桌面版 fork：helper 抢不到单实例锁时的退出码（与 runtime/electron-helper/main.js 一致） */
+export const HELPER_SINGLE_INSTANCE_EXIT_CODE = 75;
+/** 桌面版 fork：单实例锁重试间隔（ms） */
+export const HELPER_LOCK_RETRY_MS = 3000;
+
 export class HelperProcess {
   declare readonly options: HelperOptions;
   declare readonly logger: Logger;
@@ -295,6 +300,8 @@ export class HelperProcess {
   declare private lastStartAt: number;
   /** stdout 按行缓冲（协议行按 \n 切分）。用 declare + 构造器赋值，避免类字段降级出外部 helper */
   declare private stdoutBuffer: string;
+  /** 桌面版 fork：「锁被占、等待中」日志只打一次 */
+  declare private lockWaitLogged: boolean;
 
   constructor(options: HelperOptions = {}, logger: Logger = console) {
     this.options = options;
@@ -305,6 +312,7 @@ export class HelperProcess {
     this.restartFailures = 0;
     this.lastStartAt = 0;
     this.stdoutBuffer = '';
+    this.lockWaitLogged = false;
   }
 
   start(): import('node:child_process').ChildProcess | undefined {
@@ -350,6 +358,12 @@ export class HelperProcess {
     child.once('exit', (code, signal) => {
       if (this.child !== child) return;
       this.child = undefined;
+      if (!this.stopping && code === HELPER_SINGLE_INSTANCE_EXIT_CODE) {
+        // 桌面版 fork：另一个 helper 持有单实例锁（别的宿主在跑，或旧实例还没退干净）。
+        // 不算崩溃、不触发熔断：定期重试，等对方退出后接管。
+        this.scheduleLockRetry();
+        return;
+      }
       if (!this.stopping) {
         this.logger.warn?.(
           `dsh-pet desktop helper exited (code=${String(code)}, signal=${String(signal)}); restarting`,
@@ -470,6 +484,23 @@ export class HelperProcess {
         /* 已经退出了 */
       }
     });
+  }
+
+  /** 桌面版 fork：单实例锁被占时的重试（固定间隔，不计入连续崩溃） */
+  private scheduleLockRetry(): void {
+    if (this.restartTimer || this.stopping) return;
+    if (!this.lockWaitLogged) {
+      this.lockWaitLogged = true;
+      this.logger.warn?.(
+        `dsh-pet desktop helper: another instance holds the single-instance lock; ` +
+          `retrying every ${HELPER_LOCK_RETRY_MS}ms until it exits`,
+      );
+    }
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = undefined;
+      this.start();
+    }, HELPER_LOCK_RETRY_MS);
+    this.restartTimer.unref?.();
   }
 
   private scheduleRestart(): void {

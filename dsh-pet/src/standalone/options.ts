@@ -92,6 +92,6 @@ export function describePets(pets: Record<string, unknown>[]): string {
  * 因此这里保留一份最小镜像；规则若变，测试与提示文案会露出来。
  */
 export function isDesktopVisible(pet: Record<string, unknown>): boolean {
-  const display = pet.display;
-  return display === 'desktop' || display === 'both';
+  // 桌面版 fork：除 none 外一律上桌面
+  return pet.display !== 'none';
 }

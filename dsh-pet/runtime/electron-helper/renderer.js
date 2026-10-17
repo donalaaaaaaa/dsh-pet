@@ -64,9 +64,10 @@ async function boot() {
     const cfg = await loadConfig();
     config = cfg;
     hideError();
-    const pets = cfg.pets.filter((p) => S.isDesktopVisible(p.display));
+    // 桌面版 fork：只取第一只桌面宠物
+    const pets = cfg.pets.filter((p) => S.isDesktopVisible(p.display)).slice(0, S.MAX_DESKTOP_PETS || 1);
     if (pets.length === 0) {
-      showError('配置中没有 display 为 desktop/both 的宠物，桌面模式不显示宠物');
+      showError('配置中没有可显示的宠物（display 全为 none），桌面模式不显示宠物');
       scheduleReboot();
       return;
     }

@@ -12,10 +12,16 @@ import type { Animations, ModelSelection, Pet, PetDisplay, PhysicsParams, Weight
 export const PET_DISPLAYS: PetDisplay[] = ['web', 'desktop', 'both', 'none'];
 
 /** 该宠物是否参与浏览器 overlay 渲染 */
-export const isWebVisible = (display: PetDisplay): boolean => display === 'web' || display === 'both';
+// 桌面版 fork：浏览器 overlay 永不渲染（只保留桌面一只，杜绝「网页一只 + 桌面一只」）
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export const isWebVisible = (_display: PetDisplay): boolean => false;
 
 /** 该宠物是否参与桌面模式（Electron 透明窗）渲染 */
-export const isDesktopVisible = (display: PetDisplay): boolean => display === 'desktop' || display === 'both';
+// 桌面版 fork：除 none 外一律上桌面（web/both 旧配置也归到桌面）
+export const isDesktopVisible = (display: PetDisplay): boolean => display !== 'none';
+
+/** 桌面版 fork：桌面最多只显示一只宠物 */
+export const MAX_DESKTOP_PETS = 1;
 
 /** 把 host 的成品聚合拍平成渲染用宠物列表：
  *  条目级字段（animations / animationWeights / eventsRefreshSec / physics / confineToScreen /
