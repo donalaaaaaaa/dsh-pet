@@ -36,10 +36,14 @@ class PetSprite {
     // 但身体永不越界（漫游/拖拽都不会弄丢宠物）。与浏览器 overlay 的 sideAllow 同一套语义。
     this.sideAllow = (S.HIT_BOX.x0 / 640) * this.size;
     window.__dshPetDebug.sideAllow = this.sideAllow;
-    // 窗口四周外扩（= WINDOW_MARGIN_RATIO×宠物尺寸）：sprite 钉在 (margin.l, margin.t)，
-    // 窗口 = sprite + 四边余量——气泡/未来弹窗显示在余量里；余量透明且点击穿透
+    // 窗口四周外扩：左右下 = WINDOW_MARGIN_RATIO×宠物尺寸（既有取值，不动）；
+    // **上边距按气泡最大高度算**——气泡锚字号、窗口余量锚宠物，两者本就会脱钩：宠物变小
+    // （或关掉 followPet 把字号固定）时半只宠物的余量装不下气泡，气泡顶端会被窗口上边缘切掉。
+    // 余量是透明且点击穿透的，加高没有副作用（与菜单贴边那类"屏幕裁切"问题是两回事）。
+    // 注意：余量自此**不再四边相等**，主进程不能再按「窗口宽/4」反推命中区，故 setBounds 一并上报余量。
     const m = this.size * WINDOW_MARGIN_RATIO;
-    this.margin = { t: m, r: m, b: m, l: m };
+    const fontConf = pet.font || config.font || S.DEFAULT_FONT;
+    this.margin = { t: Math.max(m, S.bubbleTopMarginPx(fontConf, this.size)), r: m, b: m, l: m };
     window.__dshPetDebug.winMargin = this.margin;
     // 宠物包围盒左上角在【工作区】坐标系里的位置（本窗口的位置 = 宠物的位置）
     this.pos = { x: 0, y: 0 };
@@ -51,6 +55,10 @@ class PetSprite {
     this.weights = pet.animationWeights || cfg.animationWeights;
     // 拖拽抛掷物理参数（顶层全局；拍平已吹入实例，兜底回全局/默认）
     this.physics = pet.physics || config.physics || S.DEFAULT_PHYSICS;
+    // 字体（全局一份；拍平已吹入实例，兜底回主条目/默认）：字号按本宠物尺寸算（resolveFontPx），
+    // 字体族不在这里用——它是全局变量、由 renderer.js 注入 documentElement。
+    // fontConf 已在上面算窗口上边距时取好（上边距要用同一份字号）
+    this.font = fontConf;
     // 抛掷锁定在当前屏幕（根字段；拍平已吹入实例，兜底回主条目/默认）：
     // true = 甩出去只在松手时所在那块屏内弹（屏缝当墙），false = 照常跨屏飞行
     this.confineToScreen = pet.confineToScreen === true || config.confineToScreen === true;
@@ -128,6 +136,11 @@ class PetSprite {
     this.el.style.left = this.margin.l + 'px';
     this.el.style.top = this.margin.t + 'px';
     this.el.style.setProperty('--pet-size', this.size + 'px');
+    // 字号（配置 font）：按本宠物尺寸算好最终 px 注入 —— 气泡与悬浮提示的 CSS 读这两个变量
+    // （与浏览器端同一套变量名、同一份换算 S.resolveFontPx，见 shared/fonts.ts）
+    const fontPx = S.resolveFontPx(this.font, this.size);
+    this.el.style.setProperty('--dsh-pet-font-bubble', fontPx.bubble + 'px');
+    this.el.style.setProperty('--dsh-pet-font-tip', fontPx.tip + 'px');
     const stage = document.createElement('div');
     stage.className = 'pet-stage';
     stage.style.transform = 'translateY(' + this.bottomPad + 'px)';
@@ -284,6 +297,10 @@ class PetSprite {
         toScreen(this.bottomPad),
         fly ? toScreen(fly.vx) : 0,
         fly ? toScreen(fly.vy) : 0,
+        // 窗口余量（DIP）：主进程据此算宠物身体命中区——余量不再四边相等（上边距按气泡加高），
+        // 不能再按「窗口宽/4」反推（见 pointer-target.js 的 spriteHitRect）。
+        toScreen(this.margin.l),
+        toScreen(this.margin.t),
       );
     }
     // 位置变了（宠物漫游/拖拽/飞行，窗口跟着动）：提示若正显示必须重摆一次——它跟的是光标，
@@ -1178,7 +1195,9 @@ class PetSprite {
     // 碎碎念/对话项无条件显示：手动触发不受 whisperEnabled 限制（该字段只影响自动周期轮询）
     // 首项文案随宿主形态变（OPEN_TARGET）：宿主是 DSH 桌面应用时点是"唤起桌面应用窗口"，仍叫「打开网站」会误导
     const tools = [{ label: OPEN_TARGET === 'desktop' ? '打开 DeepSeek Harness' : '打开网站', action: 'open-site' }];
-    if (this.pet.balanceEnabled) tools.push({ label: '查看余额', action: 'show-balance' });
+    // 「查看余额」无条件显示（与浏览器端一致）：关了 balanceEnabled 的宠物也能点——手动请求不受开关限制
+    //（该开关只关自动轮询与档位动画），点了一定给答复。
+    tools.push({ label: '查看余额', action: 'show-balance' });
     tools.push(
       { label: '碎碎念', action: 'whisper' },
       { label: '对话', action: 'chat' },
@@ -1276,8 +1295,9 @@ class PetSprite {
   // 「查看余额」菜单：POST 动作让 host 刷新余额（写进 S），随即**立刻跑一拍 /state** 拿结果展示
   // （0 延迟，不用等下一个 1s；展示走 showBalanceNow/showBalanceNotice 同一路径）。
   // 注意这里不再直接拉余额：数据只有一个出口（S），菜单只负责"让它刷新"。
+  // **不做 balanceEnabled 门控**（菜单项也无条件显示）：手动请求不受开关限制——开关只关自动轮询与档位动画，
+  // 关掉余额的宠物被点一次菜单也该看到数据（与浏览器端一致）。
   showBalanceFromMenu() {
-    if (!this.pet.balanceEnabled) return;
     S.postAction(BALANCE_URL)
       .then((ok) => {
         if (!ok) console.warn('[dsh-pet] 菜单查看余额：刷新动作未成功');
@@ -1397,7 +1417,7 @@ class PetSprite {
     const whisperImg = slot === 'whisper' ? S.createMemeImage(this.whisperImage, BASE, this.assetRoot) : null;
     this.bubble.classList.toggle(
       'is-whisper',
-      // 余额「文字说明」（不可用状态）同样要换行变体：默认 nowrap 会把长文案顶出宠物宽度
+      // 余额「文字说明」（不可用状态）同样套用紧凑变体：字号更小、宽度下限更窄，多行说明更紧凑
       slot === 'whisper' || slot === 'work' || (slot === 'balance' && this.balanceWrap),
     );
     this.bubble.classList.toggle(S.MEME_BUBBLE_CLASS, !!whisperImg);

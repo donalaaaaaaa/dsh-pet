@@ -45,6 +45,9 @@ import {
 import { TOOLTIP_CLASS, TOOLTIP_CSS, TOOLTIP_GAP_RATIO, tooltipPlacement } from '../shared/tooltip';
 // 对话弹窗：与桌面共用同一份组件（数据经 host /chat 读写同一份记忆）
 import { mountChatDialog } from '../shared/chat';
+// 字体（全局配置 font）：种类 → CSS 字体栈、字号 → 最终 px。换算只在 shared 一处，
+// 与桌面端共用同一份（fontStackOf / resolveFontPx），避免两端各算一套后漂移。
+import { fontStackOf, resolveFontPx } from '../shared/fonts';
 import { petBridge } from './settings';
 import { notifyFromFrame } from './notify';
 
@@ -147,6 +150,7 @@ export function makePetUI(rt: {
     balance,
     balanceTick,
     balanceNoticeTick,
+    balanceManual,
     workStatus,
     workStatusTick,
     say,
@@ -159,6 +163,9 @@ export function makePetUI(rt: {
     balance: BalanceState | null;
     balanceTick: number;
     balanceNoticeTick: number;
+    /** 这次余额是不是**用户手动要的**（右键「查看余额」/ `/balance` 命令；host 在叶子里标 manual）。
+     *  手动请求一律给答复：即使本宠物关掉了 balanceEnabled，也要弹气泡（开关只关自动轮询）。 */
+    balanceManual: boolean;
     workStatus: WorkStatusSnapshot | null;
     workStatusTick: number;
     /** 本宠物的「说一句话」（碎碎念/命令气泡/对话回复三合一；容器从 S 分发下来） */
@@ -172,6 +179,9 @@ export function makePetUI(rt: {
   }) {
     // ---- 尺寸（由配置传入；容器/设置页更新后即时跟随）----
     const [size, setSize] = useState(cfg.size);
+    // 字号（全局配置 font）：按本宠物尺寸算好最终 px 注入 root（气泡与悬浮提示读它）。
+    // 随 size / cfg.font 变化即时重算——followPet 关闭时结果与 size 无关（见 resolveFontPx）。
+    const fontPx = resolveFontPx(cfg.font, size);
     const halfW = size / 2;
     const halfH = (size * 9) / 16 / 2;
     // 舞台脚底垫高（宠物站立于脚底线）：命中框 y、碰撞 body 框、渲染 stage 位移共用
@@ -423,16 +433,26 @@ export function makePetUI(rt: {
       },
       [],
     );
-    // 余额事件：容器拉取成功后递增 balanceTick → 按档位播放事件动画 + 弹气泡
-    // （仅启用余额功能的宠物触发：未启用则该宠物完全不播余额动画、不显示气泡；
-    //   无效/不支持按设计不触发动画，错误由容器侧显式上报）
+    // 余额事件：容器拉取成功后递增 balanceTick → 按档位播放事件动画 + 弹气泡。
+    // 两条门控分得很清楚：
+    //  - 弹气泡：**手动请求**（右键「查看余额」/ `/balance` 命令，host 在叶子里标了 manual）无条件弹——
+    //    用户问了就得有答复，哪怕这只宠物关了 balanceEnabled、哪怕服务商没有百分比语义；
+    //    自动轮询则要求 balanceEnabled 且有百分比依据。与碎碎念同一条原则：开关只关自动，不关手动。
+    //  - 档位动画：始终只属于启用余额的宠物（关掉开关的宠物不该因为被点了一次菜单就突然演一遍）。
     const prevTickRef = useRef(0);
     useEffect(() => {
-      if (!cfg.balanceEnabled) return; // 未启用余额功能 -> 该宠物对余额事件完全免疫
       if (balanceTick === 0 || balanceTick === prevTickRef.current) return;
       prevTickRef.current = balanceTick;
       if (!balance || !balance.ok) return;
+      if (!cfg.balanceEnabled && !balanceManual) return; // 自动轮询受开关门控；手动无条件通过
       const p = balancePercent(balance);
+      if (balanceManual || p !== undefined) {
+        setBubbleOn(true);
+        // 气泡 10s 定时消失（与动画解耦：即使动画被点击/拖拽打断，气泡也按时收起；重复触发先清旧定时器）
+        if (bubbleTimerRef.current !== null) window.clearTimeout(bubbleTimerRef.current);
+        bubbleTimerRef.current = window.setTimeout(() => setBubbleOn(false), BUBBLE_DURATION_MS);
+      }
+      if (!cfg.balanceEnabled) return; // 档位动画只属于启用余额的宠物
       if (p === undefined) return; // 当前数据源没有百分比语义（如 DeepSeek 余额），不触发档位动画
       const pool = petAnims.events?.balance;
       if (!pool || pool.length === 0) {
@@ -459,10 +479,6 @@ export function makePetUI(rt: {
           name,
       );
       stopMove();
-      setBubbleOn(true);
-      // 气泡 10s 定时消失（与动画解耦：即使动画被点击/拖拽打断，气泡也按时收起；重复触发先清旧定时器）
-      if (bubbleTimerRef.current !== null) window.clearTimeout(bubbleTimerRef.current);
-      bubbleTimerRef.current = window.setTimeout(() => setBubbleOn(false), BUBBLE_DURATION_MS);
       setOnce(true);
       setAnim(name);
       // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -470,10 +486,10 @@ export function makePetUI(rt: {
 
     // 余额不可用（服务商未登记 / 缺凭证 / 抓取失败）：容器判定该提示时递增 balanceNoticeTick
     // → 本宠物只弹「文字说明」气泡，不播档位动画（非 ok 没有百分比语义，档位动画无从映射）。
-    // 门控与成功路径一致（仅 balanceEnabled 的宠物提示）；显隐/定时与成功路径同一套（10s 自动消失）。
+    // 门控：自动轮询要求 balanceEnabled；**手动请求无条件弹**（用户问了就该有答复，包括"服务商不支持"这件事）。
     const prevNoticeRef = useRef(0);
     useEffect(() => {
-      if (!cfg.balanceEnabled) return; // 未启用余额功能 -> 该宠物对余额事件完全免疫
+      if (!cfg.balanceEnabled && !balanceManual) return; // 自动轮询受开关门控；手动无条件通过
       if (balanceNoticeTick === 0 || balanceNoticeTick === prevNoticeRef.current) return;
       prevNoticeRef.current = balanceNoticeTick;
       if (!balance || balance.ok) return;
@@ -1365,9 +1381,22 @@ export function makePetUI(rt: {
 
     // ---- 右键菜单（统一自绘组件：树 + 渲染 + 样式与桌面共用 src/shared/menu.ts） ----
     // 注意：菜单是独立浮层，只在宠物命中区拦截右键（preventDefault + stopPropagation），
-    // 绝不进入/改动 DSH 页面自己的菜单；浏览器端只有「碎碎念 / 回到初始位置 + 动作」——
-    // 无「打开网站 / 查看余额」（打开网站=就在网页里；查看余额已由对话框 /balance 命令实现）。
+    // 绝不进入/改动 DSH 页面自己的菜单。浏览器端工具项 = 查看余额 / 碎碎念 / 对话 / 回到初始位置
+    // （无「打开网站」——宠物就在网页里；无「重载配置」——刷新页面即可）。
     const handleMenuAction = (leaf: MenuLeaf) => {
+      if (leaf.action === 'show-balance') {
+        // 查看余额（与桌面菜单同一套语义）：POST 动作端点让 host 立即刷新一次并写入 S（manual 标记随数据一起写），
+        // 随即**立刻跑一拍 /state** 拿结果展示——0 延迟，不必等下一个轮询周期。
+        // 动作端点不回数据：余额只有一个出口（/state 的 sections.balance），与碎碎念同一条契约。
+        console.info('[dsh-pet] 菜单查看余额 pet=' + cfg.id);
+        postAction('/dsh-pet-7340/balance')
+          .then((ok: boolean) => {
+            if (!ok) console.warn('[dsh-pet] 余额刷新动作未成功 pet=' + cfg.id);
+            statePoller.now();
+          })
+          .catch((e: unknown) => console.warn('[dsh-pet] 余额刷新异常', e));
+        return;
+      }
       if (leaf.action === 'whisper') {
         // 手动碎碎念：POST 动作端点让 host 立即新生成一句（写进 S）。
         // 动作**不回文本**——收到 ok 后叫醒一拍 /state，文本随下一拍到达并弹气泡（0 延迟）。
@@ -1453,9 +1482,11 @@ export function makePetUI(rt: {
       setAnim(leaf.anim);
     };
     const handleContextMenu = (e: ReactNS.MouseEvent<HTMLDivElement>) => {
-      // 工具项（碎碎念——手动触发**不受 whisperEnabled 限制**，该字段只影响自动周期轮询；
-      // 回到初始位置，两端共用）+ 动作树（动作→分类→具体动画）
+      // 工具项（查看余额 / 碎碎念 / 对话 / 回到初始位置，与桌面端同一套）+ 动作树（动作→分类→具体动画）。
+      // 「查看余额」**无条件显示**（与桌面端一致）：即使该宠物关了 balanceEnabled 也能点——手动请求不受开关限制
+      //（该开关只关自动轮询与档位动画），与碎碎念「手动触发不受 whisperEnabled 限制」同一条原则。
       const tree: MenuNode[] = [
+        { label: '查看余额', action: 'show-balance' },
         { label: '碎碎念', action: 'whisper' },
         { label: '对话', action: 'chat' },
         { label: '回到初始位置', action: 'home' },
@@ -1522,7 +1553,7 @@ export function makePetUI(rt: {
           on: whisperBubbleOn,
         });
       }
-      if (bubbleOn && balance && cfg.balanceEnabled) {
+      if (bubbleOn && balance && (cfg.balanceEnabled || balanceManual)) {
         return h(BalanceBubble, { state: balance, on: bubbleOn });
       }
       if (workBubbleOn && workText && cfg.workStatusEnabled) {
@@ -1559,7 +1590,15 @@ export function makePetUI(rt: {
       'data-corner': corner,
       'data-facing': facing,
       style: Object.assign(
-        { '--dsh-pet-size': size + 'px', '--dsh-pet-mx': margin.x + 'px', '--dsh-pet-my': margin.y + 'px' },
+        {
+          '--dsh-pet-size': size + 'px',
+          '--dsh-pet-mx': margin.x + 'px',
+          '--dsh-pet-my': margin.y + 'px',
+          // 字号（配置 font）：注入算好的最终 px —— 气泡与悬浮提示的 CSS 读这两个变量
+          // （CSS 侧带原值回退，漏注入也不会坏，见 bubble.ts / tooltip.ts）
+          '--dsh-pet-font-bubble': fontPx.bubble + 'px',
+          '--dsh-pet-font-tip': fontPx.tip + 'px',
+        },
         rootStyle,
       ),
       children: [
@@ -1604,6 +1643,9 @@ export function makePetUI(rt: {
     const [balance, setBalance] = useState<BalanceState | null>(null);
     const [balanceTick, setBalanceTick] = useState(0);
     const [balanceNoticeTick, setBalanceNoticeTick] = useState(0);
+    // 这次余额是不是**用户手动要的**（host 在叶子里标 manual）：下发给各宠物，
+    // 决定「关了 balanceEnabled 的宠物要不要也答复」——手动请求无条件弹，开关只关自动。
+    const [balanceManual, setBalanceManual] = useState(false);
     // 上次已提示的不可用原因（reason:provider）：自动轮询只在原因变化时再弹（判定在 src/shared，两端同一份）
     const noticeKeyRef = useRef<string | null>(null);
     // 余额结果 → 状态与气泡（周期刷新与手动触发**共用这一条路径**，避免各写一份后漂移）。
@@ -1613,6 +1655,7 @@ export function makePetUI(rt: {
     const applyBalanceRef = useRef<(state: BalanceState, explicit: boolean) => void>(() => {});
     applyBalanceRef.current = (state, explicit) => {
       setBalance(state);
+      setBalanceManual(explicit); // 手动标记随本次数据一起下发（每次到达都覆盖，人工标记不会滞留）
       if (state.ok) {
         setBalanceTick((t) => t + 1); // 成功：播档位动画 + 弹余额气泡
         return;
@@ -1630,6 +1673,15 @@ export function makePetUI(rt: {
     const [workStatusTick, setWorkStatusTick] = useState(0);
     // 说话（碎碎念 / 命令气泡 / 对话回复三合一）：容器统一轮询 /state 的 pets.<id>.say，
     // 按宠物分发到对应 PetCard（sayRef + sayTick；见下方统一轮询与 PetCard 的 say 分支）。
+
+    // 字体族（全局配置 font.family）→ documentElement 上的全局变量：对话窗与得分弹窗挂在 body 下、
+    // 继承不到宠物根容器，只能走全局；气泡与悬浮提示也一并从这里继承。
+    // 多只宠物的 font 同值（配置只有一份），重复设置无副作用；列表为空（配置尚未加载）时不动。
+    useEffect(() => {
+      const family = pets[0]?.font?.family;
+      if (family === undefined) return;
+      document.documentElement.style.setProperty('--dsh-pet-font-family', fontStackOf(family));
+    }, [pets]);
 
     useEffect(() => {
       let alive = true;
@@ -1651,7 +1703,9 @@ export function makePetUI(rt: {
       };
       /** 拉成品聚合：host readAllConfig 的输出（字段填满、绝对正确），客户端零校验零兜底 */
       const loadMerged = async (): Promise<Record<string, Record<string, unknown>>> => {
-        const r = await fetch('/dsh-pet-7340/config');
+        // cache:'no-store' 与 fetchState 同口径：配置是动态的，任何形式的缓存命中都会让
+        // 「发现版本变化 → 重拉」拿到旧值（响应端也已带 no-cache，请求端与响应端一起防）
+        const r = await fetch('/dsh-pet-7340/config', { cache: 'no-store' });
         if (!r.ok) throw new Error('config HTTP ' + r.status);
         return (await r.json()) as Record<string, Record<string, unknown>>;
       };
@@ -1700,10 +1754,20 @@ export function makePetUI(rt: {
       if (!ready) return;
       let alive = true;
       let baseline: Record<string, number> | null = null;
+      // 配置版本基线：与叶子同一套约定——首拉只记基线，之后与上一拍不同才动作
+      let configBaseline: string | undefined;
       const poll = async () => {
         try {
           const s = await fetchState();
           if (!alive || !s) return;
+          // 配置被别处改过（桌面端右键改 display / 另一个标签页保存 / 用户手改配置文件）→ 重拉配置重拍平。
+          // 这是「桌面端改了、浏览器端要刷新才可见」的解药：宿主把配置 mtime 挂在 /state 上，1s 内自动跟随。
+          if (configBaseline === undefined) {
+            configBaseline = s.configVersion;
+          } else if (s.configVersion !== undefined && s.configVersion !== configBaseline) {
+            configBaseline = s.configVersion;
+            petBridge.reload(); // 内部 GET /config（该响应已带 no-cache）→ applyMerged → visiblePets 重算
+          }
           if (baseline === null) {
             baseline = flattenCounters(s); // 首拉：只记基线，不渲染
             return;
@@ -1765,6 +1829,7 @@ export function makePetUI(rt: {
             balance,
             balanceTick,
             balanceNoticeTick,
+            balanceManual,
             workStatus,
             workStatusTick,
             say: sayRef.current[p.id],
