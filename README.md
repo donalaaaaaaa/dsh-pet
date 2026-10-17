@@ -1,4 +1,6 @@
 > **桌面版 fork**：基于 [PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet) 0.3.7（MIT）二次开发——只在桌面显示、只有一只、Electron helper 全局单实例。改动说明见 [dsh-pet/README.md](dsh-pet/README.md)。
+>
+> **安装**：先在 DSH「插件管理」卸载官方 `dsh-pet`，再在安装框填 `github:donalaaaaaaa/dsh-pet#release`（`release` 分支是构建好的插件包；`main` 根目录是源码仓库，直接装会报「没有声明组合包」）。
 
 # dsh-pet 🐾
 
