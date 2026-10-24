@@ -45,7 +45,7 @@ try {
   );
   process.exit(3);
 }
-const { app, BrowserWindow, ipcMain, screen, shell, protocol } = electronApi;
+const { app, BrowserWindow, ipcMain, screen, shell, protocol, Tray, Menu, nativeImage } = electronApi;
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { readFileSync, writeFileSync } = require('node:fs');
@@ -53,11 +53,18 @@ const fsPromises = require('node:fs/promises');
 // 点击穿透兜底通道的纯判定（不依赖 Electron 的 forward 鼠标钩子；见文件头注释）
 const { decideWindowIgnore, pointerZone } = require('./pointer-target.js');
 // 置顶看门狗：WS_EX_TOPMOST 只是样式位，不等于窗口真的在置顶带（见 topmost-watchdog.js 头部）
-const { TOPMOST_WATCHDOG_TICK_MS, shouldReassertTopmost } = require('./topmost-watchdog.js');
+const {
+  TOPMOST_WATCHDOG_TICK_MS,
+  TOPMOST_WATCHDOG_ENABLED,
+  shouldReassertTopmost,
+  topmostLevel,
+} = require('./topmost-watchdog.js');
 // 宿主存活判定（issue #56：宿主退出 → 管道断开 → 自己退，绝不弹框、绝不留僵尸）
 const { HOST_POLL_MS, hostIsGone, isBrokenPipeError, parseHostPid } = require('./host-liveness.js');
 // 全局 DPI 线性化的纯判定与换算（含平台例外：macOS 的 DIP 已是「点」，无需补偿；见该文件头）
 const { shouldLinearize, resolveForcedScale, resolvePetScale } = require('./dpi-linearization.js');
+// 托盘的平台差异（模板图 / 左键是否自动弹菜单 / Dock）：规则住在模块里，main.js 只接线
+const { trayPlatform } = require('./tray-platform.js');
 const { buildDeskGeometry } = require('./desktop-geometry.js');
 
 // 允许无用户手势直接播放（余额动画等）
@@ -66,7 +73,20 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 // 显式定名：Helper 是被 `electron.exe <main.js>` 直接拉起的，Electron 取不到 app 名会回落成
 // "Electron"，userData 便落到 %APPDATA%\Electron —— 那是所有这么跑的 Electron 脚本的公共目录，
 // 我们的 DPI 缓存与 Chromium profile 都会和别人混在一起。必须赶在任何 getPath('userData') 之前设。
+// 应用模式：本文件被 `src/app/main.ts` 直接 import 进同一进程（独立应用，不 spawn 子进程）。
+// 双击启动的用户没有终端可按 Ctrl+C，托盘上必须有一个「退出」，否则只能去任务管理器杀进程。
+// 退出项不只给独立应用（issue #178）：手动 start-desktop 流同样没有终端；BRIDGE 模式则由宿主
+// 决定能不能退（GET /quit 探 canQuit，DSH 宿主答 false）。见 startTray 里的 quitApp。
+// DSH 内的桌面模式不设这个变量，托盘形态与 userData 目录都保持原样。
+const APP_MODE = process.env.DSH_PET_APP_MODE === '1';
+// Captured only for in-process app requests; never exposed to renderer URLs or logs.
+const APP_TOKEN = APP_MODE ? process.env.DSH_PET_APP_TOKEN : undefined;
+// 名字必须与 src/host/storage-paths.ts 的 DESKTOP_APP_NAME 逐字一致
+// （storage-paths.test.ts 会直接读本文件比对，改名不同步测试就红）。
 app.setName('dsh-pet-electron-helper');
+// 应用模式只改**数据目录**，不改应用名：独立应用与 DSH 内的 helper 若共用同一个 userData，
+// 两个 Chromium 进程会抢同一份 profile（单例锁）互相踢。名字不动也就不会触发上面那个防漂移测试。
+if (APP_MODE) app.setPath('userData', path.join(app.getPath('appData'), 'dsh-pet'));
 
 /** DPI 探测子进程模式：不建窗口，只把主屏 scaleFactor 打到 stdout 就退出（见 probePrimaryScale） */
 const DPI_PROBE = process.env.DSH_PET_DPI_PROBE === '1';
@@ -377,12 +397,15 @@ const offBodyMs = new Map();
  * 桌面宠物列表（[{id,size}]）：宿主经 DSH_PET_PETS 透传（每只宠物一个窗口）。
  * 解析失败/未透传（手动 start-desktop）时回落到单个默认宠物窗口；renderer 首帧发来的
  * set-bounds 会按真实配置自校正尺寸与位置。
+ * **空数组是合法输入，不等于「未透传」**：宿主在「桌面宠物被全部关掉、但 Helper 仍需活着
+ * 托住托盘」时会明确传 []（见 src/host/index.ts 的 desktopModeEverActive），此时必须建
+ * 0 个窗口——回落成默认窗口会让渲染端读到「没有 desktop/both 宠物」并弹出红色错误条。
  */
 function petsFromEnv() {
   try {
     const raw = process.env.DSH_PET_PETS || '';
     const arr = JSON.parse(raw);
-    if (Array.isArray(arr) && arr.length > 0) {
+    if (Array.isArray(arr)) {
       return arr.map((p, i) => ({
         id: String(p?.id ?? `pet-${i}`),
         size: Number(p?.size) > 0 ? Number(p.size) : 462,
@@ -452,7 +475,7 @@ function createPetWindows() {
         spellcheck: false,
       },
     });
-    win.setAlwaysOnTop(true, 'screen-saver');
+    win.setAlwaysOnTop(true, topmostLevel(process.platform));
     win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
     // 窗口被其他窗口（另一只宠物）完全遮挡时，Chromium 默认会暂停本窗口渲染，
     // 导致大宠物移动盖过小宠物时小宠物显示为"消失"。关闭后台节流，让被遮挡
@@ -507,19 +530,26 @@ function createPetWindows() {
     // "是不是置顶"永远查得出 true、宠物却再也看不见，用户侧只能重启 helper 才回来。
     // 这里低频重钉一次：落地就是 SetWindowPos(HWND_TOPMOST, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)，
     // 不移动、不重绘、不抢焦点（判定的纯逻辑与全部依据见 topmost-watchdog.js）。
+    //
+    // 【注意】总开关 `TOPMOST_WATCHDOG_ENABLED` 当前是 **关闭** 的：重钉会把桌宠抬到所有置顶窗口
+    // 之上，打断全屏游戏与截图。关闭的理由、代价、以及一个尚未解决的「显示桌面后误置顶」bug，
+    // 都写在 topmost-watchdog.js 的文件头里 —— 要重新启用前请先读完那几节。
     let lastTopmostAssertMs = Date.now();
     const topmostTimer = setInterval(() => {
       const nowMs = Date.now();
-      const due = shouldReassertTopmost({
-        nowMs,
-        lastAssertMs: lastTopmostAssertMs,
-        destroyed: win.isDestroyed(),
-        visible: win.isVisible(),
-        paused: pointerFallbackPaused,
-      });
+      const due = shouldReassertTopmost(
+        {
+          nowMs,
+          lastAssertMs: lastTopmostAssertMs,
+          destroyed: win.isDestroyed(),
+          visible: win.isVisible(),
+          paused: pointerFallbackPaused,
+        },
+        TOPMOST_WATCHDOG_ENABLED,
+      );
       if (!due) return;
       lastTopmostAssertMs = nowMs;
-      win.setAlwaysOnTop(true, 'screen-saver');
+      win.setAlwaysOnTop(true, topmostLevel(process.platform));
     }, TOPMOST_WATCHDOG_TICK_MS);
     win.on('closed', () => {
       clearInterval(pointerTimer);
@@ -533,7 +563,9 @@ function createPetWindows() {
       offBodyMs.delete(win.id);
     });
     win
-      .loadFile('index.html', {
+      // 绝对路径：本文件现在有两条运行方式（被宿主 spawn / 被 lib/app.js 同进程 require），
+      // 相对路径会按 Electron 的 app 路径解析——同进程时那是 lib/，必然 ERR_FILE_NOT_FOUND。
+      .loadFile(path.join(__dirname, 'index.html'), {
         query: {
           configUrl,
           bridge: BRIDGE ? '1' : '0',
@@ -661,6 +693,139 @@ async function handleBridgeRequest(request) {
   return new Response(resp.body ?? '', { status: resp.status || 200, headers });
 }
 
+// ---------- 系统托盘：桌面端显示开关 ----------
+// 为什么托盘放在本进程：它是桌面模式唯一「不进浏览器」的入口。某只宠物的 display 被改成
+// web/none 之后，它在桌面上就没有窗口了，**它自己的右键菜单也跟着消失**；托盘是此时唯一还能
+// 在桌面侧把它切回桌面的地方（宿主的设置页要开浏览器，网页端宠物的右键菜单也得先开浏览器）。
+// 但它不是非有不可：main 条目的 `trayEnabled` 为 false 时不建托盘（默认 true，见下 startTray）。
+// 这种情况下宿主也不会为它常驻——判据是 desktopModeEverActive && trayEnabled（src/host/index.ts）：
+// 托盘关掉后已经没有需要保住的东西，让本进程活着只是白烧一个空进程。
+// 数据不新增任何通道：读配置与写回都走渲染端在用的同一条 bridge（手动 start-desktop 流退回 HTTP）。
+// 菜单是静态的，但每次切换 display 都会让宿主重启本进程（syncDesktop），新进程按新配置重建菜单，
+// 所以这里不需要任何「重建菜单刷新勾选」的逻辑。
+
+const PET_ROUTE = '/dsh-pet-7340';
+const ORIGIN = new URL(process.env.DSH_PET_CONFIG_URL || 'http://127.0.0.1:3080/dsh-pet-7340/config').origin;
+const TRAY_PLATFORM = trayPlatform(process.platform);
+
+/** 与宿主 handlePetRoute 通信：bridge 模式走管道，手动 start-desktop 流退回 HTTP 直连 */
+async function hostRequest(method, url, body) {
+  if (BRIDGE) return bridgeRequest(method, url, body);
+  const resp = await fetch(ORIGIN + url, {
+    method,
+    headers: {
+      ...(body ? { 'content-type': 'application/json' } : {}),
+      ...(APP_TOKEN ? { 'X-DSH-Pet-Token': APP_TOKEN } : {}),
+    },
+    body,
+  });
+  return { status: resp.status, body: await resp.text() };
+}
+
+const isDesktopDisplay = (display) => display === 'desktop' || display === 'both';
+
+/** 翻转「桌面位」：both↔web、desktop↔none——浏览器位保持不动，因此不制造新的单向门 */
+const toggleDisplay = (display) =>
+  display === 'both' ? 'web' : display === 'web' ? 'both' : display === 'desktop' ? 'none' : 'desktop';
+
+let tray = null;
+
+/** 写回某只宠物的 display：宿主写完配置会重启本进程，响应可能永远不回（同 sprite.js 的 setPetDisplay） */
+function traySetPetDisplay(id, display) {
+  hostRequest('POST', PET_ROUTE + '/pet-display', JSON.stringify({ id, display })).catch((e) => {
+    console.error('[dsh-pet-desktop-helper] tray pet-display failed:', String(e && e.message ? e.message : e));
+  });
+}
+
+/** 托盘图标：包内 logo 缩到 16×16（macOS 要模板图，否则深色菜单栏下看不见） */
+function trayIcon() {
+  const file = path.join(__dirname, '..', '..', 'assets', 'logo.png');
+  let img = nativeImage.createFromPath(file);
+  if (img.isEmpty()) {
+    // 读不到图标 = 托盘不可见但菜单逻辑照跑，最难查的一种坏法：必须留下能定位的日志
+    console.error('[dsh-pet-desktop-helper] tray icon missing or unreadable: ' + file);
+    return img;
+  }
+  img = img.resize({ width: 16, height: 16 });
+  if (TRAY_PLATFORM.templateImage) img.setTemplateImage(true);
+  return img;
+}
+
+/**
+ * 建托盘：列出**配置里全部**宠物（含 display 为 web/none 的——它们当前不在桌面上、勾是空的，
+ * 点一下就能送回来，这是托盘相对宠物右键菜单的增量）。勾 = 当前 display 含 desktop/both。
+ */
+async function startTray() {
+  try {
+    // 请求行要携带回调 URL，而端口在 startBridgeCallback 的 listen 回调里才有值（最多等 2s）
+    for (let i = 0; BRIDGE && !bridgeCallbackUrl && i < 100; i += 1) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const resp = await hostRequest('GET', PET_ROUTE + '/config');
+    const merged = JSON.parse(resp.body || '{}');
+    // 托盘开关（main 条目的 trayEnabled）：只有**显式 false** 才不建——缺失或写坏时保持建，
+    // 免得一份老配置/一个错值让托盘无声消失（非法值的告警由宿主读取侧统一报）。
+    // 与下面的 pets 取自同一份成品配置，不新增任何通道。
+    if (merged && merged.main && merged.main.trayEnabled === false) return;
+    // 成品聚合的形状是 { <条目>: <整份配置文档> }——**顶层键不是宠物**，宠物在各条目的
+    // `pets` 数组里。与渲染端同一契约（renderer.js 的 loadConfig → S.flattenConfigPets，
+    // 规则源码见 src/shared/config.ts:26）。托盘只要 id/name/display，故不吹条目级字段。
+    // 踩过的坑：把条目本身当宠物读 → name/display 恒为 undefined → 标题回落成 id（菜单只剩
+    // 一个条目）、勾选恒为未选中、点击恒提交 desktop（现象就是「显示与不显示没区别」）。
+    const pets = Object.values(merged)
+      .flatMap((conf) => (conf && Array.isArray(conf.pets) ? conf.pets : []))
+      .map((pet) => ({
+        id: String((pet && pet.id) || ''),
+        name: String((pet && pet.name) || '').trim(), // host 已保证 name 缺失时回落 id
+        display: String((pet && pet.display) || ''),
+      }))
+      .filter((pet) => pet.id);
+    if (!pets.length) return; // 配置里没有任何宠物：没有可切换的对象，不建托盘
+    // 托盘「退出」是否可用（issue #178）：三种来源各自成立——
+    //   · 独立应用（APP_MODE）：本进程就是全部，app.quit() 即退出；
+    //   · 手动 start-desktop.mjs（!BRIDGE）：node 父进程只等本进程退出，app.quit() 后进程树干净收场；
+    //   · BRIDGE：宿主拉起的 Helper，**不能自己 app.quit()**——那会被当成崩溃按退避重启（点了只是闪一下），
+    //     必须问宿主愿不愿意退（GET /quit 的 canQuit）。DSH 宿主不提供该能力，菜单项因此不出现。
+    // 探测失败（旧宿主没有 /quit、返回素材兜底等）一律按"不支持"处理，行为与改动前一致。
+    let hostCanQuit = false;
+    if (BRIDGE && !APP_MODE) {
+      try {
+        hostCanQuit = JSON.parse((await hostRequest('GET', PET_ROUTE + '/quit')).body || '{}').canQuit === true;
+      } catch (e) {
+        console.error('[dsh-pet-desktop-helper] quit capability probe failed:', String(e && e.message ? e.message : e));
+      }
+    }
+    const canQuit = APP_MODE || !BRIDGE || hostCanQuit;
+    const quitApp = () => {
+      if (!BRIDGE || APP_MODE) {
+        app.quit();
+        return;
+      }
+      // 交给宿主停机：它会先停本进程再退，所以这条请求不用等结果
+      hostRequest('POST', PET_ROUTE + '/quit').catch((e) => {
+        console.error('[dsh-pet-desktop-helper] tray quit failed:', String(e && e.message ? e.message : e));
+      });
+    };
+    tray = new Tray(trayIcon());
+    tray.setToolTip('dsh-pet 桌面宠物');
+    tray.setContextMenu(
+      Menu.buildFromTemplate([
+        ...pets.map((pet) => ({
+          label: pet.name || pet.id,
+          type: 'checkbox',
+          checked: isDesktopDisplay(pet.display),
+          click: () => traySetPetDisplay(pet.id, toggleDisplay(pet.display)),
+        })),
+        ...(canQuit ? [{ type: 'separator' }, { label: '退出', click: quitApp }] : []),
+      ]),
+    );
+    // Windows 上 setContextMenu 只接管右键，左键默认什么都不做（macOS 相反：左键即弹菜单）
+    if (TRAY_PLATFORM.leftClickPopsMenu) tray.on('click', () => tray.popUpContextMenu());
+  } catch (e) {
+    console.error('[dsh-pet-desktop-helper] tray init failed:', String(e && e.message ? e.message : e));
+  }
+}
+
 app.whenReady().then(() => {
   // 探测子进程：此时没有 force-device-scale-factor，读到的是 Windows 的真实主屏缩放。
   // 退出推迟一拍——在 ready 回调里直接 app.exit() 会赶在 stdout 落盘前拆掉进程
@@ -693,6 +858,13 @@ app.whenReady().then(() => {
     );
     startBridgeCallback(); // 宿主应答回调服务器（stdin 在 Electron 主进程不可用，改走本地 HTTP）
   }
+
+  // macOS：桌面宠物不该占 Dock——Dock 里多一个图标只会碍事。**不跟 trayEnabled 联动**：
+  // 宠物本体的右键菜单在，桌面侧仍能操作（只有「宠物全不在桌面」时才真正没有入口，那是另一件事）。
+  if (TRAY_PLATFORM.hideDock && app.dock) app.dock.hide();
+
+  // 托盘：不 await（建窗与建托盘互不依赖），内部自己等 bridge 回调服务就绪
+  void startTray();
 
   createPetWindows();
 
@@ -1114,6 +1286,21 @@ app.whenReady().then(() => {
   }
 });
 
+// 退出时销毁托盘图标：不销毁会在 Windows 通知区留下「幽灵图标」（鼠标划过才消失）。
+// 注意宿主改 display 时是 SIGTERM/SIGKILL 硬杀（helper-process.ts），Windows 上那是
+// TerminateProcess、拦不到，所以这条只覆盖优雅退出（窗口全关、宿主存活探测判定退出等）。
+app.on('before-quit', () => {
+  if (!tray) return;
+  try {
+    tray.destroy();
+  } catch (e) {
+    console.error('[dsh-pet-desktop-helper] tray destroy failed:', String(e && e.message ? e.message : e));
+  }
+  tray = null;
+});
+
 app.on('window-all-closed', () => {
+  // 托盘常驻：桌面上没有宠物也要留着（否则「全关掉」就再也切不回来，见 index.ts 的 desktopModeEverActive）
+  if (tray) return;
   app.quit();
 });

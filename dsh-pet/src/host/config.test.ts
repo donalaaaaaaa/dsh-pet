@@ -339,7 +339,162 @@ describe('readUserConfig —— 用户层读取必须容忍 JSONC 注释（保�
   });
 });
 
+describe('saveUserConfig —— 系统托盘开关（trayEnabled）', () => {
+  test('非法值整包拒绝（与其它全局布尔同口径，不静默丢用户输入）', () => {
+    assert.equal(saveUserConfig({ pets: PETS, trayEnabled: 'false' }, undefined), null);
+    assert.equal(saveUserConfig({ pets: PETS, trayEnabled: 0 }, undefined), null);
+  });
+
+  test('请求体没带 → 透传磁盘旧值（不得把用户关掉的托盘又打开）', () => {
+    const out = saveUserConfig({ pets: PETS }, { trayEnabled: false }) as Record<string, unknown>;
+    assert.equal(out.trayEnabled, false);
+  });
+
+  test('请求体带了 → 以请求体为准', () => {
+    const out = saveUserConfig({ pets: PETS, trayEnabled: false }, { trayEnabled: true }) as Record<string, unknown>;
+    assert.equal(out.trayEnabled, false);
+  });
+});
+
+describe('JSONC 配置读取：字符串中的注释标记与转义', () => {
+  const prompts = [
+    '请原样解释 // 示例 这段文字',
+    '请原样解释 /* 示例 */ 这段文字',
+    '链接 https://example.test/a//b?q=/*text*/',
+    '请解释 "引号内的 // 内容" 和 /* 内容 */',
+    String.raw`反斜杠 \\ 与转义引号 \" 后面的 // 内容`,
+    '结尾反斜杠 \\',
+  ];
+
+  for (const whisperPrompt of prompts) {
+    test(`读取与合并原样保留 ${JSON.stringify(whisperPrompt)}`, () => {
+      const overlay = { whisperPrompt, metadata: { '/* 字段名 */': '// 字段值' } };
+      const { paths, dir } = pathsWithUser('// 外部行注释\n' + JSON.stringify(overlay) + '\n/* 外部块注释 */');
+      try {
+        assert.deepEqual(readUserConfig(paths), overlay);
+        assert.equal(userConfigUnparsable(paths), false);
+        assert.equal(readAllConfig(paths).main.whisperPrompt, whisperPrompt);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test('注释中的引号和注释标记不影响 CRLF、CR 与文件末尾行注释', () => {
+    const { paths, dir } = pathsWithUser(
+      '// " /* 行注释\r\n{\r  /* " // 块注释\r\n */ "chatMemoryRounds": 3\r}\r// 文件末尾',
+    );
+    try {
+      assert.deepEqual(readUserConfig(paths), { chatMemoryRounds: 3 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('读取后保存保留提示词内容及高级配置', () => {
+    const overlay = { whisperPrompt: '解释 // 和 /* */', physics: BASE.physics, animations: BASE.animations };
+    const { paths, dir } = pathsWithUser(JSON.stringify(overlay));
+    try {
+      const out = saveUserConfig({ pets: BASE.pets }, readUserConfig(paths)) as Record<string, unknown>;
+      assert.equal(out.whisperPrompt, overlay.whisperPrompt);
+      assert.deepEqual(out.physics, overlay.physics);
+      assert.deepEqual(out.animations, overlay.animations);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const raw of ['{"chatMemoryRounds": 1/* 注释 */2}', '{"chatMemoryRounds": 3} /* 未结束']) {
+    test(`拒绝损坏的配置 ${raw}`, () => {
+      const { paths, dir } = pathsWithUser(raw);
+      try {
+        assert.equal(readUserConfig(paths), undefined);
+        assert.equal(userConfigUnparsable(paths), true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 const PETS = BASE.pets;
+
+describe('saveUserConfig pet IDs', () => {
+  test('rejects repeated IDs before writing a configuration that would lose a pet', () => {
+    assert.equal(
+      saveOnce({
+        pets: [
+          { ...PETS[0], name: 'first' },
+          { ...PETS[0], name: 'second' },
+        ],
+      }),
+      null,
+    );
+  });
+
+  test('rejects IDs that collide after the same trimming used during reads', () => {
+    assert.equal(
+      saveOnce({
+        pets: [
+          { ...PETS[0], id: ' main ' },
+          { ...PETS[0], id: 'main' },
+        ],
+      }),
+      null,
+    );
+  });
+
+  test('rejects blank and non-string IDs instead of writing unreadable entries', () => {
+    for (const id of ['', '   ', '\t\n', 42, true, null, {}, ['main']]) {
+      assert.equal(saveOnce({ pets: [{ ...PETS[0], id }] }), null, JSON.stringify(id));
+    }
+  });
+
+  test('canonical IDs survive a save/read round trip, including Chinese IDs', () => {
+    const clean = saveOnce({
+      pets: [
+        { ...PETS[0], id: ' main ' },
+        { ...PETS[0], id: ' 副宠 ' },
+      ],
+    });
+    assert.ok(clean);
+    const pets = clean.pets as Record<string, unknown>[];
+    assert.deepEqual(
+      pets.map((p) => p.id),
+      ['main', '副宠'],
+    );
+    const paths = withBase({}, clean);
+    try {
+      assert.deepEqual(
+        (readAllConfig(paths).main.pets as Record<string, unknown>[]).map((p) => p.id),
+        ['main', '副宠'],
+      );
+    } finally {
+      rmSync(dirname(paths.defaultFile), { recursive: true, force: true });
+    }
+  });
+
+  test('keeps distinct case-sensitive IDs and allows matching display names', () => {
+    const clean = saveOnce({
+      pets: [
+        { ...PETS[0], id: 'Blue' },
+        { ...PETS[0], id: 'blue' },
+      ],
+    });
+    assert.ok(clean);
+    assert.deepEqual(
+      (clean.pets as Record<string, unknown>[]).map((p) => p.id),
+      ['Blue', 'blue'],
+    );
+  });
+
+  test('retains the ID length limit and path character restrictions', () => {
+    assert.ok(saveOnce({ pets: [{ ...PETS[0], id: 'a'.repeat(64) }] }));
+    for (const id of ['a'.repeat(65), 'pet/name', 'pet\\name', 'pet:name', 'pet\0name']) {
+      assert.equal(saveOnce({ pets: [{ ...PETS[0], id }] }), null);
+    }
+  });
+});
 
 describe('saveUserConfig —— 表情包配图开关（白名单 + 透传保留）', () => {
   test('两个配图开关随请求体写入', () => {
@@ -445,6 +600,90 @@ describe('saveUserConfig —— 宠物固定 fixedEnabled（per-pet 白名单）
     const pets = out?.pets as Record<string, unknown>[];
     assert.equal(pets.find((p) => p.id === 'a')?.fixedEnabled, true);
     assert.equal(pets.find((p) => p.id === 'b')?.fixedEnabled, false);
+  });
+});
+
+describe('readAllConfig —— 实例级人设 whisperPrompt（实例覆盖 / 不填生效值）', () => {
+  const petAt = (merged: Record<string, Record<string, unknown>>, n = 0): Record<string, unknown> =>
+    (merged.main.pets as Record<string, unknown>[])[n];
+
+  test('实例写了 → 原样带出（消费端据此取代条目人设）', () => {
+    const merged = readAllConfig(withBase({}, { pets: [{ ...BASE.pets[0], whisperPrompt: '我是猫娘' }] }));
+    assert.equal(petAt(merged).whisperPrompt, '我是猫娘');
+    // 条目级那份仍在：两者靠 petPersona 二选一，合并器不做合并
+    assert.equal(merged.main.whisperPrompt, BASE.whisperPrompt);
+  });
+
+  test('没写 → 结果里**没有**该键（回落条目由消费端做，合并器不填生效值）', () => {
+    // 合并器一旦把条目人设填进每只实例，/pet-display（拿合并结果回调 saveUserConfig 写盘）
+    // 就会把"跟随条目"固化成显式覆盖，之后改条目人设这些实例不再跟着变——这条钉住它。
+    const pet = petAt(readAllConfig(withBase({})));
+    assert.equal('whisperPrompt' in pet, false);
+  });
+
+  test('空串 / 纯空白 → 当没写（设置页清空输入框后提交的就是空串）', () => {
+    for (const value of ['', '   \n\t ']) {
+      const pet = petAt(readAllConfig(withBase({}, { pets: [{ ...BASE.pets[0], whisperPrompt: value }] })));
+      assert.equal('whisperPrompt' in pet, false, `${JSON.stringify(value)} 应被当作没写`);
+    }
+  });
+
+  test('显式写了非字符串 → 当没写，不抛错（脏值绝不进渲染层）', () => {
+    for (const value of [42, { a: 1 }, ['x'], true]) {
+      const pet = petAt(readAllConfig(withBase({}, { pets: [{ ...BASE.pets[0], whisperPrompt: value }] })));
+      assert.equal('whisperPrompt' in pet, false, `${JSON.stringify(value)} 应被忽略`);
+    }
+  });
+
+  test('逐实例独立：两只宠物各写各的，不互相传染', () => {
+    const merged = readAllConfig(
+      withBase(
+        {},
+        {
+          pets: [
+            { ...BASE.pets[0], id: 'a', whisperPrompt: 'A 的人设' },
+            { ...BASE.pets[0], id: 'b' },
+          ],
+        },
+      ),
+    );
+    const pets = merged.main.pets as Record<string, unknown>[];
+    assert.equal(pets.find((p) => p.id === 'a')?.whisperPrompt, 'A 的人设');
+    assert.equal('whisperPrompt' in (pets.find((p) => p.id === 'b') as Record<string, unknown>), false);
+  });
+});
+
+describe('saveUserConfig —— 实例级人设 whisperPrompt（白名单 + 清空 = 删除覆盖）', () => {
+  const petAt = (out: Record<string, unknown> | null, n = 0): Record<string, unknown> =>
+    (out?.pets as Record<string, unknown>[])[n];
+
+  test('非空字符串 → trim 后落盘（不在白名单就会被保存悄悄丢掉——physics 的老 bug 同款）', () => {
+    const out = saveOnce({ pets: [{ ...PETS[0], whisperPrompt: '  我是猫娘\n' }] });
+    assert.equal(petAt(out).whisperPrompt, '我是猫娘', 'whisperPrompt 必须在 saveUserConfig 的白名单里');
+  });
+
+  test('空串 / 纯空白 → 不写该键（= 删除这只宠物的覆盖、回落条目）', () => {
+    for (const value of ['', '   ']) {
+      assert.equal(
+        'whisperPrompt' in petAt(saveOnce({ pets: [{ ...PETS[0], whisperPrompt: value }] })),
+        false,
+        `${JSON.stringify(value)} 不该落盘`,
+      );
+    }
+  });
+
+  test('未传 → 不凭空造字段（旧客户端 / 设置页不传时不得写一个空人设）', () => {
+    assert.equal('whisperPrompt' in petAt(saveOnce({ pets: [{ ...PETS[0] }] })), false);
+  });
+
+  test('传了非字符串 → 整体拒绝（宿主回 400，不静默丢用户输入）', () => {
+    assert.equal(saveOnce({ pets: [{ ...PETS[0], whisperPrompt: 42 }] }), null);
+  });
+
+  test('/pet-display 式往返：合并结果直接喂回 save，人设不丢（也不会被写成空串）', () => {
+    const merged = readAllConfig(withBase({}, { pets: [{ ...BASE.pets[0], whisperPrompt: '我是猫娘' }] }));
+    const layerPets = merged.main.pets as Record<string, unknown>[];
+    assert.equal(petAt(saveOnce({ pets: layerPets })).whisperPrompt, '我是猫娘');
   });
 });
 

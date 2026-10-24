@@ -32,7 +32,7 @@ function toLocal(v) {
 // 绕开 DSH Desktop 2.0.3+ 的浏览器访问闸门（只放行带令牌的请求，插件自拉进程的裸 HTTP 全 403）
 const BRIDGE = params.get('bridge') === '1';
 // 工具项「打开网站」的去向（主进程按宿主形态经 query 注入，见 main.js 的 OPEN_TARGET）：
-// desktop = 宿主是 DSH 桌面应用，菜单项改叫「打开 DeepSeek Harness」并唤起桌面应用主窗口；site = 打开站点。
+// desktop = 宿主是 DSH 桌面应用，菜单项改叫「打开软件」并唤起桌面应用主窗口；site = 打开站点。
 const OPEN_TARGET = params.get('openTarget') === 'desktop' ? 'desktop' : 'site';
 // 视口 = 全部显示器工作区的外接矩形（多显示器时即整个桌面；窗口只是宠物的一块局部画布）。
 // 它只是**坐标系原点与比例换算基准**：位置比例（customPos）、漫游 ratio 都按它算。
@@ -145,7 +145,19 @@ const BASE = BRIDGE ? 'dsh-pet-bridge://dsh-pet/dsh-pet-7340' : ORIGIN + '/dsh-p
 const STATE_URL = BASE + '/state'; // 轮询统一状态 S：前端 1s 轮询的唯一数据源（余额/工作状态/通知/说话）
 const BALANCE_URL = BASE + '/balance'; // 余额刷新动作（POST，写 S；数据本身从 /state 读）
 const WHISPER_URL = BASE + '/whisper';
+// 实况上报（渲染端 → 宿主，**内部通道**）：第三方用 GET /pose 读宿主存下的这份快照
+const POSE_REPORT_URL = BASE + '/pose/report';
+// 实况上报的节流间隔（ms）。sendBounds 在走位/抛掷时是**逐帧**调用的（60Hz），必须合并。
+// **必须带 trailing edge**（到点读当前值推一次）：只做 leading 会把"走位结束时的最后一次位置"
+// 丢掉，第三方读到的永远是中途值，而且没有任何报错。
+const POSE_THROTTLE_MS = 400;
 const BUBBLE_DURATION_MS = 10 * 1000; // 余额/碎碎念气泡展示时长（与浏览器一致：定时自动消失，与动画解耦）
+// 余额气泡展开/收起换内容前的等待（ms）：与 .pet-bubble 的 opacity 过渡同为 .25s，
+// 淡出走完再换内容，否则内容会在半透明时被替换 = 看得见的硬切（与浏览器 bubble.ts 同值）
+const BALANCE_FADE_MS = 250;
+// /state 长轮询的挂起时长（与浏览器端同值）：宿主在"版本没变"时最多挂这么久。
+// 1s 是前端自己定的下限——空闲时请求率与改造前一致（1 req/s），叶子一变宿主立刻返回。
+const STATE_WAIT_MS = 1000;
 // 窗口四周外扩 = 该比例 × 宠物尺寸：为气泡 / 未来可能的弹窗预留显示空间；
 // 外扩区透明且点击穿透（只有身体命中区可交互）。单点可调——按实际观感改这里。
 const WINDOW_MARGIN_RATIO = 0.5;
@@ -153,7 +165,7 @@ const WINDOW_MARGIN_RATIO = 0.5;
 // ---------- 全局状态 ----------
 const rootEl = document.getElementById('root');
 const errorEl = document.getElementById('pet-error');
-let config = null; // { pets: 拍平后的成品实例列表, physics, confineToScreen }（loadConfig 填充）
+let config = null; // { pets: 拍平后的成品实例列表, physics, confineToScreen, clickSoundEnabled }（loadConfig 填充）
 let sprites = []; // PetSprite[]（本窗口只装一只宠物）
 let balance = null; // BalanceState（本窗口单宠共用）
 let balanceTick = 0;

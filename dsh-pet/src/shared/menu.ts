@@ -7,7 +7,7 @@
 // 菜单数据单一事实来源 = 合并后的 animations 配置（用户覆盖层自动生效）。
 //
 // 菜单层级（与产品定义一致）：
-//   一级 = 工具项 + 动作：打开网站（宿主是 DSH 桌面应用时，同一项的文案与去向变成「打开 DeepSeek Harness」——见 runtime/electron-helper/main.js 的 OPEN_TARGET）/ 查看余额 / 重载配置（桌面端专属）与 回到初始位置（两端共用），由各壳注入；
+//   一级 = 工具项 + 动作：打开网站（宿主是 DSH 桌面应用时，同一项的文案与去向变成「打开软件」——见 runtime/electron-helper/main.js 的 OPEN_TARGET）/ 查看余额 / 重载配置（桌面端专属）与 回到初始位置（两端共用），由各壳注入；
 //   二级（动作的子级）= 分类：待机 / 转向 / 拖拽 / 点击回应 / 移动 / config 随机动作分类 / 事件档位
 //   三级 = 具体动画名
 //
@@ -33,11 +33,19 @@ export interface MenuLeaf {
    * chat=打开对话弹窗；home=回到初始位置；reload=重载配置（桌面端专属：重启桌面 Helper，
    * 全部桌面宠物窗口按最新配置重建——浏览器端刷新页面即可，不注入此项）；
    * set-display=改这只宠物的显示位置（目标值见 display 字段；**两端都注入**——桌面端拿它把
-   * 宠物送走、浏览器端拿它把宠物送到桌面，菜单项统一由 displayMenuBranch() 提供）。
+   * 宠物送走、浏览器端拿它把宠物送到桌面，菜单项统一由 displayMenuBranch() 提供）；
+   * third-party=第三方注册的菜单项（见 buildMoreBranch）——点击只把 (owner, label) 上报给宿主，
+   * 具体做什么由注册方自己决定。
    * 手动触发均不受 whisperEnabled 影响（该字段只关自动周期轮询） */
-  action?: 'open-site' | 'show-balance' | 'whisper' | 'chat' | 'home' | 'reload' | 'set-display';
+  action?: 'open-site' | 'show-balance' | 'whisper' | 'chat' | 'home' | 'reload' | 'set-display' | 'third-party';
   /** set-display 的目标显示位置（与设置页「显示位置」下拉框同一套取值） */
   display?: PetDisplay;
+  /** third-party：注册它的 owner（身份键，**只用于回传，不显示**）。同一个 owner 的项收在同一个
+   *  分组下；只有一项时跳过这层、直接平铺（见 buildMoreBranch）。 */
+  owner?: string;
+  /** 项目右侧的灰色小字（如快捷键「Ctrl+左键」）：纯视觉提示，不参与显示文本匹配，也不影响
+   *  动作分发。缺省不占位（不显示任何东西）。 */
+  hint?: string;
 }
 
 /** 分支：带子菜单的项 */
@@ -67,6 +75,83 @@ export const displayMenuBranch = (): MenuBranch => ({
     { label: '都不', action: 'set-display', display: 'none' },
   ],
 });
+
+/** 第三方菜单项（宿主经 /state 的 sections.menu 下发的快照，一条 = 一个可点项）。 */
+export interface MenuMoreItem {
+  /** 注册方身份；同时也是一级分组名（显示用） */
+  owner: string;
+  /** 项名（显示用，也是回传给注册方的标识） */
+  label: string;
+}
+
+/** 第三方菜单项统一收在这个一级菜单下（宿主自己的菜单项不进这里）。 */
+export const MORE_MENU_LABEL = '更多';
+
+/**
+ * 从 `/state` 的 `sections.menu.data` 里读出**本端**要显示的第三方菜单项。
+ *
+ * 两侧（浏览器 / 桌面）共用同一份解析：快照来自网络，字段一律按"可能不存在"处理——
+ * 非法条目静默丢弃，绝不让一条坏数据把整个右键菜单搞崩（菜单是高频交互入口）。
+ *
+ * `surface` = 本端身份（浏览器传 `web`，桌面 helper 传 `desktop`）：条目上的 `target` 等于它
+ * 或等于 `both` 才收。`target` 缺失或不是三个字面量之一 → 按 `both` 处理（老宿主没有这个字段，
+ * 宁可在两端都显示，也不要让一个正在用的第三方菜单凭空消失）。
+ */
+export function readMenuItems(data: unknown, surface: 'web' | 'desktop'): MenuMoreItem[] {
+  if (!data || typeof data !== 'object') return [];
+  const items = (data as { items?: unknown }).items;
+  if (!Array.isArray(items)) return [];
+  const out: MenuMoreItem[] = [];
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    // 端过滤：只认三个字面量，其余（缺失 / 写坏）一律当 both
+    const rawTarget = rec.target;
+    const target = rawTarget === 'web' || rawTarget === 'desktop' || rawTarget === 'both' ? rawTarget : 'both';
+    if (target !== 'both' && target !== surface) continue;
+    const owner = rec.owner;
+    const label = rec.label;
+    if (typeof owner === 'string' && owner !== '' && typeof label === 'string' && label !== '') {
+      out.push({ owner, label });
+    }
+  }
+  return out;
+}
+
+/**
+ * 「更多」一级菜单：把第三方菜单项拼成菜单树的一枝；没有第三方项时返回 null（调用方不注入，
+ * 菜单里就不会出现一个空的「更多」）。
+ *
+ * 层级规则就一条：**按项数决定要不要 owner 这一层**——
+ *   - 该 owner 只有 1 项 → 直接 `更多 / 弹弓`（跳过分组，少一次点击）；
+ *   - 2 项及以上      → `更多 / 小游戏 / 弹弓`、`钓鱼`。
+ * 于是某个 owner 从 1 项变成 2 项时，它原来那一项会"缩进"进分组里——这是这条规则必然的副作用，
+ * 换来的是只有一个项的插件不必多开一层。
+ *
+ * 同名不同 owner 的项允许共存（用户看到两个「弹弓」，点了各回各的 owner）：菜单文案由注册方负责，
+ * 这里不做任何去重、编号或来源标注。
+ */
+export function buildMoreBranch(items: readonly MenuMoreItem[]): MenuBranch | null {
+  // owner → 项名（Map 保序：注册顺序 = 分组顺序 = 组内顺序）
+  const groups = new Map<string, string[]>();
+  for (const item of items) {
+    const list = groups.get(item.owner);
+    if (list) list.push(item.label);
+    else groups.set(item.owner, [item.label]);
+  }
+  const children: MenuNode[] = [];
+  for (const [owner, labels] of groups) {
+    if (labels.length === 1) {
+      children.push({ label: labels[0], action: 'third-party', owner });
+    } else {
+      children.push({
+        label: owner,
+        children: labels.map((label) => ({ label, action: 'third-party' as const, owner })),
+      });
+    }
+  }
+  return children.length > 0 ? { label: MORE_MENU_LABEL, children } : null;
+}
 
 /** 事件名 → 分类标签（无映射时用事件名本身） */
 const EVENT_LABELS: Record<string, string> = {
@@ -127,7 +212,7 @@ export const MENU_CSS = [
   '.dsh-pet-menu{position:fixed;left:0;top:0;z-index:2147483000;color:#2b2b2b;font-size:13px;line-height:1.5;',
   "font-family:'Microsoft YaHei UI','Segoe UI','PingFang SC',sans-serif;user-select:none;pointer-events:auto}",
   '.dsh-pet-menu,.dsh-pet-menu *{box-sizing:border-box}',
-  '.dsh-pet-menu-column{position:absolute;min-width:150px;max-width:240px;padding:4px;',
+  '.dsh-pet-menu-column{position:absolute;min-width:150px;max-width:300px;padding:4px;',
   'background:rgba(255,255,255,.98);border:1px solid rgba(0,0,0,.12);border-radius:8px;',
   'box-shadow:0 8px 28px rgba(0,0,0,.2);max-height:min(62vh,460px);overflow-y:auto;',
   // 自定义滚动条：细圆角半透明条（Chromium 系 Chrome/Edge/Electron 走 ::-webkit-scrollbar；
@@ -145,6 +230,8 @@ export const MENU_CSS = [
   'gap:14px;padding:5px 12px;border-radius:6px;white-space:nowrap;cursor:default}',
   '.dsh-pet-menu-item:hover{background:rgba(43,99,255,.14)}',
   '.dsh-pet-menu-item>span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis}',
+  // 右侧快捷键提示（菜单项的 hint 字段）：灰色小字、不收缩、不换行；有它时该项宽到 300px 仍放得下长文案
+  '.dsh-pet-menu-hint{color:#9aa0a6;font-size:12px;flex:none;white-space:nowrap}',
   '.dsh-pet-menu-arrow{color:#9aa0a6;font-size:12px;flex:none}',
 ].join('');
 
@@ -262,6 +349,13 @@ export function mountContextMenu(opts: {
         const label = document.createElement('span');
         label.textContent = node.label;
         item.appendChild(label);
+        // 右侧灰色提示（如快捷键）：与 label 同一 flex 行，space-between 自动贴右
+        if (node.hint) {
+          const hint = document.createElement('span');
+          hint.className = 'dsh-pet-menu-hint';
+          hint.textContent = node.hint;
+          item.appendChild(hint);
+        }
         item.addEventListener('click', (e) => {
           e.preventDefault();
           e.stopPropagation();

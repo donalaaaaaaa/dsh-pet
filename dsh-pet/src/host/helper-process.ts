@@ -12,11 +12,14 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { downloadArtifact } from '@electron/get';
+
+import type { LoggerLike } from './log-file';
+// `@electron/get` 只在**真的要下载** Electron 时才用到，因此按需动态加载（见 ensureElectronDownload）：
+// 静态 import 会把它连同 got/fs-extra 一串依赖钉进每个产物的启动路径，而独立应用模式下这条路径永远不执行。
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -68,6 +71,16 @@ type Logger = {
   debug?: (...args: unknown[]) => void;
 };
 
+/** Basic file validation only; this does not validate the binary format or launch a candidate. */
+function isNonEmptyFile(path: string): boolean {
+  try {
+    const stat = statSync(path);
+    return stat.isFile() && stat.size > 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 解析 Electron 可执行文件。
  * 优先级：
@@ -96,7 +109,7 @@ export function resolveElectronPath(candidates: Array<string | undefined> = []):
   // 只认自己的落地路径（ensureElectronDownload 下载解压到 $DSH_HOME/electron）；
   // 不再去 npm 全局目录 / Program Files / /usr/bin 等别处探测别人装的 Electron。
   push(defaultElectronExe());
-  return list.find((value) => existsSync(value));
+  return list.find(isNonEmptyFile);
 }
 
 /** $DSH_HOME（默认 ~/.dsh），与 ensure-electron.mjs 的 HOME 计算一致。 */
@@ -165,6 +178,24 @@ export interface EnsureElectronOptions {
   mirror?: string;
   /** 单次下载超时（默认 10 分钟）。 */
   timeoutMs?: number;
+  /**
+   * 面向用户的日志出口（进桌宠工作气泡）。
+   * **与 console 分开**：console 留英文原文给终端 / CLI 排障，这里产出给「没有控制台的
+   * DSH 桌面版用户」看的一句短话。宿主负责截断与投递，本函数只产出文本——它不认识 state。
+   */
+  onLog?: (event: ElectronDownloadLog) => void;
+  /**
+   * 落盘日志出口（宿主注入的统一日志器，见 ./log-file）。
+   * 不传则退回 console：CLI / 单测里仍能直接在终端看到。
+   */
+  logger?: LoggerLike;
+}
+
+/** 一条下载日志：`text` 给用户看；`level='warn'` = 失败路径；`done` = 本次下载已收尾（成功或失败） */
+export interface ElectronDownloadLog {
+  text: string;
+  level: 'info' | 'warn';
+  done: boolean;
 }
 
 /**
@@ -179,14 +210,29 @@ export async function ensureElectronDownload(options: EnsureElectronOptions = {}
   const timeoutMs = options.timeoutMs ?? 10 * 60 * 1000;
   const targetDir = electronLandingDir();
   const exe = defaultElectronExe();
-  if (existsSync(exe)) return exe;
+  if (isNonEmptyFile(exe)) return exe;
 
-  // 下载日志用 console 直出（ctx.logger 在部分宿主不映射到终端，排障时看不到）。
-  const log = (message: string): void => console.log(`[dsh-pet] ${message}`);
-  const warn = (message: string): void => console.warn(`[dsh-pet] ${message}`);
+  // 下载日志默认走 console；宿主会把它自己的统一日志器传进来——桌面版没有控制台，
+  // console 直出等于丢失（ctx.logger 在部分宿主也不映射到终端，见 issue #168 的教训）。
+  const sink = options.logger ?? console;
+  const log = (message: string): void => sink.info?.(`[dsh-pet] ${message}`);
+  const warn = (message: string): void => sink.warn?.(`[dsh-pet] ${message}`);
+  // 同一件事两个出口（见 EnsureElectronOptions.onLog）：console 原文 + 给用户看的一句。
+  // 文案刻意分成两套——版本号 / 路径 / 耗时对开发者有用，对用户是噪音，不合并成同一句。
+  const info = (consoleText: string, text: string, done = false): void => {
+    log(consoleText);
+    options.onLog?.({ text, level: 'info', done });
+  };
+  const fail = (consoleText: string, text: string): void => {
+    warn(consoleText);
+    options.onLog?.({ text, level: 'warn', done: true });
+  };
   const startedAt = Date.now();
 
-  log(`Electron not found, downloading v${version} (${PLAT}-${process.arch}) ...`);
+  if (existsSync(exe)) {
+    info(`Electron cache is empty or not a regular file: ${exe}`, 'Electron 缓存无效，准备重新下载');
+  }
+  info(`Electron not found, downloading v${version} (${PLAT}-${process.arch}) ...`, `正在下载 Electron ${version}`);
 
   try {
     // 目录创建也可能失败（权限不足、同名文件等），与下载失败一样降级到浏览器宠物。
@@ -201,6 +247,8 @@ export async function ensureElectronDownload(options: EnsureElectronOptions = {}
     timer.unref?.();
     let nextLogAt = Date.now() + 3000;
     try {
+      // 按需加载（见文件头的 import 注释）：只有走到「确实要下载」这一步才会解析这个包
+      const { downloadArtifact } = await import('@electron/get');
       const zipPath = await downloadArtifact({
         version: `v${version}`,
         artifactName: 'electron',
@@ -214,14 +262,15 @@ export async function ensureElectronDownload(options: EnsureElectronOptions = {}
             const now = Date.now();
             if (!progress.total || now < nextLogAt) return;
             nextLogAt = now + 3000;
-            log(
-              `downloading ${(progress.transferred / 1024 / 1024).toFixed(1)}MB / ${(progress.total / 1024 / 1024).toFixed(1)}MB`,
-            );
+            const doneMb = (progress.transferred / 1024 / 1024).toFixed(1);
+            const totalMb = (progress.total / 1024 / 1024).toFixed(1);
+            const percent = Math.min(100, Math.floor((progress.transferred / progress.total) * 100));
+            info(`downloading ${doneMb}MB / ${totalMb}MB`, `Electron 下载 ${percent}% · ${doneMb}/${totalMb}MB`);
           },
         },
       });
       const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
-      log(`download complete (${seconds}s), extracting to ${targetDir} ...`);
+      info(`download complete (${seconds}s), extracting to ${targetDir} ...`, `下载完成（${seconds}s），正在解压`);
       // 官方 @electron-internal/extract-zip 解压（electron 43 官方安装同款）：
       // 纯 Node + native binding，跨平台一致，正确处理 symlink 与文件权限，
       // 不需要系统 unzip/tar/powershell，也没有我们手写的平台适配链。
@@ -234,17 +283,18 @@ export async function ensureElectronDownload(options: EnsureElectronOptions = {}
       // 这条路径只在真要解压时才走，失败也落进本函数的 catch → 降级到浏览器宠物。
       const { default: extract } = await import('@electron-internal/extract-zip');
       await extract(zipPath, { dir: targetDir });
-      if (!existsSync(exe)) {
-        throw new Error(`Electron zip extracted, but ${ELECTRON_REL} not found`);
+      if (!isNonEmptyFile(exe)) {
+        throw new Error(`Electron zip extracted, but ${ELECTRON_REL} is missing, empty or not a regular file`);
       }
       const readySeconds = ((Date.now() - startedAt) / 1000).toFixed(1);
-      log(`ready in ${readySeconds}s: ${exe}`);
+      info(`ready in ${readySeconds}s: ${exe}`, `Electron 就绪（${readySeconds}s），正在启动桌宠`, true);
       return exe;
     } finally {
       clearTimeout(timer);
     }
   } catch (error) {
-    warn(`ensure failed: ${error instanceof Error ? error.message : String(error)}`);
+    const reason = error instanceof Error ? error.message : String(error);
+    fail(`ensure failed: ${reason}`, `Electron 下载失败：${reason}`);
     warn('desktop pet unavailable. Set DSH_PET_ELECTRON_PATH to an existing Electron, or retry later.');
     return undefined;
   }
