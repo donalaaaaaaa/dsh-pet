@@ -34,8 +34,10 @@
  * 本模块是 host 自包含实现（不 import src/shared —— DSH 单文件加载约束）；
  * 浏览器/桌面侧的对应纯逻辑（把成品拍平成渲染列表）在 src/shared/config.ts。
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+
+import { defaultLog } from './log-file';
 
 /** 位置角落白名单 */
 const CORNERS = ['top-left', 'top-right', 'bottom-left', 'bottom-right'] as const;
@@ -89,6 +91,10 @@ export const ID_FORBIDDEN = /[\\/:\x00-\x1f]/;
  * 不在名单里的顶层字段基座仍是**内置默认**：`whisperPrompt`（人设）、`memes`（表情包）、
  * `animations` / `animationWeights`（与素材根绑定）、`workStatusTexts`（文案）——一个种类一份
  * 动画池 / 一份人设 / 一个表情包目录，各写一份才是 pet pack 的意义。
+ *
+ * 例外：**人设有实例级覆盖**。`pets[].whisperPrompt`（可选）写了就取代所属条目顶层那一份，
+ * 没写则回落条目——回落本身由消费端做（./persona 的 petPersona），合并不填生效值（见 petPersonaField 注释）。
+ * 其余实例级字段仍是固定白名单（id/name/size/4 个开关/display/position + whisperPrompt）。
  */
 const GLOBAL_DEFAULT_KEYS = [
   'physics',
@@ -109,15 +115,38 @@ const warnedKeys = new Set<string>();
 function warnOnce(key: string, message: string): void {
   if (warnedKeys.has(key)) return;
   warnedKeys.add(key);
-  console.warn('dsh-pet: ' + message);
+  defaultLog('warn', 'dsh-pet: ' + message);
 }
 
-/** 剥除 JSONC 注释（行注释 // 与块注释）得到纯 JSON */
+/** 仅删除字符串之外的 JSONC 注释，保留字符串转义、换行与相邻 JSON token 的分隔。 */
 function stripJsonc(src: string): string {
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/(^|[^\\:])\/\/.*$/gm, '$1')
-    .trim();
+  let out = '';
+  let inString = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (inString) {
+      out += ch;
+      if (ch === '\\' && i + 1 < src.length) {
+        out += src[++i];
+      } else if (ch === '"') {
+        inString = false;
+      }
+    } else if (ch === '"') {
+      inString = true;
+      out += ch;
+    } else if (ch === '/' && src[i + 1] === '/') {
+      out += ' ';
+      while (i + 1 < src.length && src[i + 1] !== '\r' && src[i + 1] !== '\n') i++;
+    } else if (ch === '/' && src[i + 1] === '*') {
+      const end = src.indexOf('*/', i + 2);
+      if (end === -1) throw new SyntaxError('Unterminated JSONC block comment');
+      out += src.slice(i, end + 2).replace(/[^\r\n]/g, ' ');
+      i = end + 1;
+    } else {
+      out += ch;
+    }
+  }
+  return out.trim();
 }
 
 /** 读取并解析 JSONC 文件；不存在/解析失败 → undefined（调用方决定处理） */
@@ -241,33 +270,6 @@ export function readPetConfigEntry(
 ): { path: string; raw: Record<string, unknown> | undefined } | undefined {
   const hit = scanPetFiles(paths.petDir).find((f) => f.prefix === entry);
   return hit ? { path: hit.path, raw: readJsonc(hit.path) } : undefined;
-}
-
-/**
- * 配置版本号（GET /state 顺带下发的「配置有没有变过」指纹）。
- *
- * 取「所有会被合并进来的配置文件」的 mtime 最大值：用户主配置（含旧路径回落）+ 全部文件宠物配置。
- * 为什么用文件时间戳而不是内存计数器：**用户手工编辑 main-config.jsonc / pet/*.json 也必须被感知**——
- * 那条路径不经过任何写接口，计数器永远不动。
- *
- * 消费端只比较「与上一拍是否相同」，不解析、不排序，所以直接给毫秒时间戳的字符串。
- * 文件都不存在（首次使用）→ "0"；首次写盘后 mtime 立刻变化，版本随之改变。
- */
-export function configVersion(paths: ConfigPaths): string {
-  let max = 0;
-  const bump = (file: string | undefined): void => {
-    if (!file) return;
-    try {
-      const st = statSync(file);
-      if (st.mtimeMs > max) max = st.mtimeMs;
-    } catch {
-      /* 文件不存在（尚未写过配置 / pet 目录为空）→ 跳过该来源 */
-    }
-  };
-  bump(paths.userFile);
-  bump(paths.legacyUserFile);
-  for (const file of scanPetFiles(paths.petDir)) bump(file.path);
-  return String(max);
 }
 
 /** animations 段完整性校验（与旧 assertAnimationsHost 同一套规则；不 throw，非法返回 false） */
@@ -397,11 +399,17 @@ function topFieldValid(key: string, value: unknown): boolean {
     }
     case 'notificationsEnabled':
       return typeof value === 'boolean';
+    case 'clickSoundEnabled':
+      // 点击音效开关（全局布尔，只读 main 条目）：与 notificationsEnabled 同一套校验
+      return typeof value === 'boolean';
     case 'whisperImageEnabled':
       return typeof value === 'boolean';
     case 'chatImageEnabled':
       return typeof value === 'boolean';
     case 'confineToScreen':
+      return typeof value === 'boolean';
+    case 'trayEnabled':
+      // 桌面模式系统托盘开关（main 条目顶层；helper 读它决定建不建托盘图标）
       return typeof value === 'boolean';
     case 'animations':
       return animationsValid(value);
@@ -592,7 +600,29 @@ function mergePet(
       marginX: petNumber(ownPos.marginX, basePos.marginX, -Infinity, label, 'position.marginX', id),
       marginY: petNumber(ownPos.marginY, basePos.marginY, -Infinity, label, 'position.marginY', id),
     },
+    // 实例级人设（可选）：只放行**非空字符串**；没写 / 空串 / 纯空白 / null → 该键不出现在结果里
+    // （回落由消费端做：./persona 的 petPersona 取不到实例级就取条目顶层）；非字符串 → 告警 + 忽略。
+    //
+    // **这里刻意不填"生效值"**：合并器的契约是"拍平用户写了什么"，而人设的默认值是**所属条目那一份**，
+    // 不是某个常量。一旦在这里把条目人设填进每只实例，/pet-display（拿合并结果 → saveUserConfig 写回）
+    // 就会把"跟随条目"固化成每只实例的显式覆盖——之后用户改条目人设，这些实例不再跟着变。
+    ...petPersonaField(p.whisperPrompt, label, id),
   };
+}
+
+/**
+ * 实例级 whisperPrompt 的合并：写了非空字符串 → 原样带出；否则返回空对象（该键不出现）。
+ * 显式写了非字符串（数字/对象/布尔）才算配置错误 → 告警一次并忽略（回落条目），与 petNumber 同口径。
+ */
+function petPersonaField(own: unknown, label: string, id: string): { whisperPrompt?: string } {
+  if (typeof own === 'string') {
+    // 空串 / 纯空白 = 没写（设置页把输入框清空后提交的就是 ''，这是合法状态，不告警）
+    return own.trim() === '' ? {} : { whisperPrompt: own };
+  }
+  if (own !== undefined && own !== null) {
+    warnOnce(`${label}:whisperPrompt:${id}`, `宠物「${id}」的 whisperPrompt 非法，已忽略（回落所属条目人设）`);
+  }
+  return {};
 }
 
 /**
@@ -639,7 +669,8 @@ export function flattenPetList(merged: Record<string, Record<string, unknown>>):
 }
 
 /** 在完成品聚合里按实例 id 定位宠物及其所属条目（host 内部消费索引）：
- *  条目 key 即素材根（assetRoot）；条目级字段（whisperPrompt/chatMemoryRounds/animations）随条目取。 */
+ *  条目 key 即素材根（assetRoot）；条目级字段（whisperPrompt/chatMemoryRounds/animations）随条目取
+ *  （唯一例外：whisperPrompt 可被实例覆盖——调用方要生效值请走 ./persona 的 petPersona，别直接读 conf）。 */
 export function findPetInstance(
   merged: Record<string, Record<string, unknown>>,
   petId: string,
@@ -654,8 +685,10 @@ export function findPetInstance(
 
 /**
  * 保存用户层（PUT /config）：更新 main-config.jsonc，接受可编辑字段（pets + 全局开关：
- * notificationsEnabled / whisperImageEnabled / chatImageEnabled / confineToScreen + physics
+ * notificationsEnabled / whisperImageEnabled / chatImageEnabled / confineToScreen / trayEnabled + physics
  * + whisperModel / chatModel + chatMemoryRounds + chatImageLimit）。
+ * pets 内除 id/name/size/四个开关/display/position 外，还接可选的 `whisperPrompt`（实例级人设；
+ * 空串 = 删除覆盖，回落条目）。
  * 编辑语义：**非白名单顶层字段（whisperPrompt / eventsRefreshSec / memes 等）从
  * `existing`（当前磁盘上的用户文件原对象）原样透传保留**——
  * 用户手动编辑的精调配置不会被设置页保存抹掉（旧实现是纯白名单重建，会整体覆盖丢失）。
@@ -670,18 +703,21 @@ export function saveUserConfig(
   const arr = Array.isArray(o.pets) ? o.pets : null;
   if (!arr || !arr.length) return null;
   const out: unknown[] = [];
+  const seenIds = new Set<string>();
   for (const p of arr) {
     if (!p || typeof p !== 'object') return null;
     const pp = p as Record<string, unknown>;
-    const id = String(pp.id ?? '');
+    // Match mergePet's canonical identity before checking uniqueness or writing to disk.
+    const id = typeof pp.id === 'string' ? pp.id.trim() : '';
     // 有意过滤文件名非法字符（Windows 保留符 + 控制字符），防止配置值逃逸 main-config.jsonc 路径
-    if (!id || id.length > 64 || ID_FORBIDDEN.test(id)) return null;
+    if (!id || id.length > 64 || ID_FORBIDDEN.test(id) || seenIds.has(id)) return null;
+    seenIds.add(id);
     const size = Number(pp.size);
     if (!Number.isFinite(size) || size <= 0) return null;
     // 显示名：可重复不校验唯一；缺失/留空/非字符串 → 按该宠物 id 处理（兼容旧配置）并告警
     let name = typeof pp.name === 'string' ? pp.name.trim() : '';
     if (!name) {
-      console.warn(`dsh-pet: pet「${id}」缺少 name，已按默认 ${id}（宠物 id）处理`);
+      defaultLog('warn', `dsh-pet: pet「${id}」缺少 name，已按默认 ${id}（宠物 id）处理`);
       name = id;
     }
     const balanceEnabled = pp.balanceEnabled;
@@ -702,7 +738,14 @@ export function saveUserConfig(
     const marginX = Number(pos.marginX);
     const marginY = Number(pos.marginY);
     if (!Number.isFinite(marginX) || !Number.isFinite(marginY)) return null;
-    out.push({
+    // 实例级人设（可选）：非空字符串才落盘（trim 后写）；空串/纯空白 = 不写该键——
+    // 落盘结果是"这只宠物没有自己的覆盖"，读取侧（./persona 的 petPersona）自动回落到所属条目。
+    // 也就是说：清空输入框 + 保存 = 删除覆盖，而不是写一个空人设。
+    // 非字符串（且非 undefined/null）与其他字段同口径：整包 400，不静默丢用户输入。
+    const rawPersona = pp.whisperPrompt;
+    if (rawPersona !== undefined && rawPersona !== null && typeof rawPersona !== 'string') return null;
+    const persona = typeof rawPersona === 'string' ? rawPersona.trim() : '';
+    const pet: Record<string, unknown> = {
       id,
       name,
       size,
@@ -712,16 +755,24 @@ export function saveUserConfig(
       fixedEnabled,
       display,
       position: { corner, marginX, marginY },
-    });
+    };
+    if (persona) pet.whisperPrompt = persona;
+    out.push(pet);
   }
   const ne = o.notificationsEnabled;
   if (ne !== undefined && typeof ne !== 'boolean') return null;
+  // 点击音效开关（全局布尔，与 notificationsEnabled 同语义）：传了必须是布尔，没传走透传保留
+  const cse = o.clickSoundEnabled;
+  if (cse !== undefined && typeof cse !== 'boolean') return null;
   const wie = o.whisperImageEnabled;
   if (wie !== undefined && typeof wie !== 'boolean') return null;
   const cie = o.chatImageEnabled;
   if (cie !== undefined && typeof cie !== 'boolean') return null;
   const cts = o.confineToScreen;
   if (cts !== undefined && typeof cts !== 'boolean') return null;
+  // 系统托盘开关（全局，仅桌面模式）：与上面几个全局布尔同语义——传了必须是布尔，没传走透传保留。
+  const te = o.trayEnabled;
+  if (te !== undefined && typeof te !== 'boolean') return null;
   // physics（拖拽抛掷手感，设置页「物理」区可图形化编辑）：整段校验——physicsValid 与读取侧
   // 是同一份规则（gravity/groundFriction ≥ 0、restitution ∈ [0,1]、throwPower > 0、两个布尔）。
   // 传了就按白名单写入；没传则走下面的透传保留（用户手改的值原样不动）。
@@ -756,9 +807,11 @@ export function saveUserConfig(
   // 对话历史条数）同样只在请求体**真的传了**时才写（未传则走下面的透传保留，不凭空造值）
   const outConfig: { pets: unknown[]; [key: string]: unknown } = { pets: out };
   if (ne !== undefined) outConfig.notificationsEnabled = ne;
+  if (cse !== undefined) outConfig.clickSoundEnabled = cse;
   if (wie !== undefined) outConfig.whisperImageEnabled = wie;
   if (cie !== undefined) outConfig.chatImageEnabled = cie;
   if (cts !== undefined) outConfig.confineToScreen = cts;
+  if (te !== undefined) outConfig.trayEnabled = te;
   if (ph !== undefined) outConfig.physics = ph;
   if (fo !== undefined) outConfig.font = fo;
   if (wm !== undefined) outConfig.whisperModel = cleanModel(wm as Record<string, unknown>);
@@ -772,9 +825,11 @@ export function saveUserConfig(
   // 否则整包调用的调用方漏传一个字段，就会把用户既有设置悄悄抹成默认。
   const bodyOwned = new Set(['pets']);
   if (ne !== undefined) bodyOwned.add('notificationsEnabled');
+  if (cse !== undefined) bodyOwned.add('clickSoundEnabled');
   if (wie !== undefined) bodyOwned.add('whisperImageEnabled');
   if (cie !== undefined) bodyOwned.add('chatImageEnabled');
   if (cts !== undefined) bodyOwned.add('confineToScreen');
+  if (te !== undefined) bodyOwned.add('trayEnabled');
   if (ph !== undefined) bodyOwned.add('physics');
   if (fo !== undefined) bodyOwned.add('font');
   if (wm !== undefined) bodyOwned.add('whisperModel');

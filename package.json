@@ -1,6 +1,6 @@
 {
   "name": "dsh-pet",
-  "version": "0.3.8-desktop.0",
+  "version": "0.3.8-desktop.1",
   "description": "【桌面版 fork】吃白饭的蓝色大肥鱼，赖在 DeepSeek Harness 里不走了。平时爱玩魔方、爱吃各种零食、偶尔打个盹，闲不住就在桌面上溜达两圈，被你拖来甩去也照旧赖着；你忙起来它跟着忙前忙后，也会帮你打理余额钱包，闲下来爱碎碎念，还乐意陪你唠两句。（本版：只在桌面显示、只有一只、全局单实例）",
   "icon": "assets/logo.png",
   "keywords": [
@@ -66,6 +66,7 @@
     "assets/fonts",
     "assets/pic",
     "assets/memes",
+    "assets/sound",
     "assets/config.jsonc",
     "assets/logo.png",
     "scripts/ensure-electron.mjs",
@@ -76,8 +77,11 @@
     "node": ">=22.12.0"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "0.135.0",
     "@electron-internal/extract-zip": "^1.0.5",
-    "@electron/get": "^5.1.0"
+    "@electron/get": "^5.1.0",
+    "openai": "7.39.0",
+    "zod": "4.6.7"
   },
   "dsh": {
     "bundle": {
@@ -87,7 +91,8 @@
       "dshReleases": {
         "0.1.7-rc.2": "incompatible",
         "0.2.0-rc.1": "compatible",
-        "0.2.0-rc.2": "compatible"
+        "0.2.0-rc.2": "compatible",
+        "0.2.1-rc.2": "compatible"
       }
     },
     "client": {

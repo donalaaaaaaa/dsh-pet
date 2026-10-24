@@ -62,6 +62,8 @@ export interface Animations {
  *    （main-config.jsonc），即"设置页改一次，所有宠物（含 pet pack）都生效"；种类文件仍可在自己
  *    顶层覆盖（见 host/config.ts 的 GLOBAL_DEFAULT_KEYS）。其余条目级字段（animations /
  *    whisperPrompt / memes / workStatusTexts …）的基座是**内置默认**，与用户层无关；
+ *    **例外：whisperPrompt 有实例级覆盖**（`pets[].whisperPrompt`，见字段注释）——它是唯一
+ *    允许写在实例上的条目级字段，写了就取代条目的那份；
  *  - extra: true 标记该宠物由 pet/ 目录文件定义：设置页不可编辑、保存时排除，
  *    由拍平逻辑统一打标，**永不出现在持久化配置里**；
  *  - assetRoot: 素材目录名（= 配置文件前缀 `<名>`，即 `pet/<名>-animation/`）；素材 URL
@@ -96,6 +98,13 @@ export interface Pet {
         marginX: number;
         marginY: number;
     };
+    /** **实例级人设**（可选，`pets[].whisperPrompt`）：碎碎念与对话共用的系统提示词正文。
+     *  写了就**取代**所属条目顶层那一份（替换，不是拼接）；没写/空串 = 回落条目。回落发生在
+     *  host 消费端（src/host/persona.ts 的 petPersona），合并器不填生效值——所以这里 undefined
+     *  就是"跟随条目"，不是错误。
+     *  **无长度上限**（与条目级 whisperPrompt 同一口径：只要求非空字符串）。
+     *  只写正文：名字（`你的名字是“X”`）与时间背景由 host 无条件追加，不要在这里重复写。 */
+    whisperPrompt?: string;
     animations?: Animations;
     animationWeights?: Weights;
     extra?: boolean;
@@ -106,7 +115,7 @@ export interface Pet {
     /** 全局默认：拖拽抛掷物理参数（用户在 main-config.jsonc 里写一次即对所有宠物生效，
      *  含 pet pack；种类文件顶层写了则用自己那份。host 合并已填默认，拍平时吹入） */
     physics?: PhysicsParams;
-    /** 全局默认：拖拽抛掷是否锁定在当前屏幕（归属规则同 physics） */
+    /** 全局默认：是否锁定在当前屏幕（归属规则同 physics）——抛掷与自主漫游都只在当前所在那块屏内活动 */
     confineToScreen?: boolean;
     /** 条目级：工作状态气泡文案（二维数组，外层索引 = workStatus 档位 0..5，内层每档可多句随机抽；
      *  host 合并已填默认，拍平时吹入；整字段缺失 = 不弹工作状态文本，只播动画） */
@@ -163,12 +172,22 @@ export interface FontConfig {
 export interface ClientConfig {
     /** 系统通知总开关：true=对话完成/生成失败/输出截断/权限申请/用户选择时弹出系统通知；缺失即配置错误 */
     notificationsEnabled: boolean;
+    /** 点击音效开关：true=点击宠物时播放内置 click-duck.wav（音量 0.5、100ms 内去重）；false=静音。
+     *  内置默认 **false**（默认静音，不突袭既有用户）。只读 main 条目这一份
+     *  （与 notificationsEnabled 同语义，pet pack 不单独覆盖） */
+    clickSoundEnabled: boolean;
+    /** 桌面模式系统托盘开关：true=桌面端启动后在通知区域（macOS 为菜单栏）建托盘——列出配置里
+     *  **全部**宠物（含 display 为 web/none 的），勾选即可切回桌面；false=不建。
+     *  缺失默认 true（内置默认开启）。仅影响桌面模式；关掉后「把不在桌面的宠物叫回桌面」在桌面侧
+     *  没有入口，只能开浏览器用设置页或网页端宠物的右键菜单。 */
+    trayEnabled: boolean;
     /** 碎碎念配图开关：true=碎碎念每次从表情包池随机抽 1 张连同文本显示（碎碎念无上下文，故随机） */
     whisperImageEnabled: boolean;
     /** 对话配图开关：true=对话时把表情包清单交模型按语境选 1 张（可不选）；false=纯文本 */
     chatImageEnabled: boolean;
-    /** 拖拽抛掷是否锁定在当前屏幕：true=甩出去只在松手时所在那块屏内弹（屏缝当墙）；
-     *  false=跨屏飞行（现状）。根字段（不属于 physics：它不改手感，只改「被允许去哪」），
+    /** 是否锁定在当前屏幕：true=宠物只在当前所在那块屏内活动——甩出去只在松手时所在那块屏内弹
+     *  （屏缝当墙），自主漫游也只在当前所在那块屏内走（越出屏缝的那一步直接取消）；
+     *  false=跨屏飞行 / 跨屏行走（现状）。根字段（不属于 physics：它不改手感，只改「被允许去哪」），
      *  条目级，缺失即配置错误 */
     confineToScreen: boolean;
     pets: Pet[];

@@ -62,17 +62,6 @@ export declare function readPetConfigEntry(paths: ConfigPaths, entry: string): {
     raw: Record<string, unknown> | undefined;
 } | undefined;
 /**
- * 配置版本号（GET /state 顺带下发的「配置有没有变过」指纹）。
- *
- * 取「所有会被合并进来的配置文件」的 mtime 最大值：用户主配置（含旧路径回落）+ 全部文件宠物配置。
- * 为什么用文件时间戳而不是内存计数器：**用户手工编辑 main-config.jsonc / pet/*.json 也必须被感知**——
- * 那条路径不经过任何写接口，计数器永远不动。
- *
- * 消费端只比较「与上一拍是否相同」，不解析、不排序，所以直接给毫秒时间戳的字符串。
- * 文件都不存在（首次使用）→ "0"；首次写盘后 mtime 立刻变化，版本随之改变。
- */
-export declare function configVersion(paths: ConfigPaths): string;
-/**
  * 唯一读取函数：内置默认 + 用户主配置 + 文件宠物逐字段合并后的完成品聚合。
  * 返回 { main: {...}, test1: {...}, ... } —— 每个条目都是原文件结构且所有字段已填满，
  * 消费端直接读，不做任何校验/兜底。每次调用重新读文件：修改配置刷新/重启即生效。
@@ -81,7 +70,8 @@ export declare function readAllConfig(paths: ConfigPaths): Record<string, Record
 /** 拍平全部条目的 pets 为单列表（host 消费端用：桌面宠物列表 / 命令 / 当前桌宠解析） */
 export declare function flattenPetList(merged: Record<string, Record<string, unknown>>): Record<string, unknown>[];
 /** 在完成品聚合里按实例 id 定位宠物及其所属条目（host 内部消费索引）：
- *  条目 key 即素材根（assetRoot）；条目级字段（whisperPrompt/chatMemoryRounds/animations）随条目取。 */
+ *  条目 key 即素材根（assetRoot）；条目级字段（whisperPrompt/chatMemoryRounds/animations）随条目取
+ *  （唯一例外：whisperPrompt 可被实例覆盖——调用方要生效值请走 ./persona 的 petPersona，别直接读 conf）。 */
 export declare function findPetInstance(merged: Record<string, Record<string, unknown>>, petId: string): {
     entry: string;
     conf: Record<string, unknown>;
@@ -89,8 +79,10 @@ export declare function findPetInstance(merged: Record<string, Record<string, un
 } | undefined;
 /**
  * 保存用户层（PUT /config）：更新 main-config.jsonc，接受可编辑字段（pets + 全局开关：
- * notificationsEnabled / whisperImageEnabled / chatImageEnabled / confineToScreen + physics
+ * notificationsEnabled / whisperImageEnabled / chatImageEnabled / confineToScreen / trayEnabled + physics
  * + whisperModel / chatModel + chatMemoryRounds + chatImageLimit）。
+ * pets 内除 id/name/size/四个开关/display/position 外，还接可选的 `whisperPrompt`（实例级人设；
+ * 空串 = 删除覆盖，回落条目）。
  * 编辑语义：**非白名单顶层字段（whisperPrompt / eventsRefreshSec / memes 等）从
  * `existing`（当前磁盘上的用户文件原对象）原样透传保留**——
  * 用户手动编辑的精调配置不会被设置页保存抹掉（旧实现是纯白名单重建，会整体覆盖丢失）。

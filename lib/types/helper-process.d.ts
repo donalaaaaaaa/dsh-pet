@@ -10,6 +10,7 @@
  * 本文件负责解析 Electron 可执行文件、以子进程方式拉起 electron-helper/main.js、
  * 守护协议通道、并在异常退出时自动重启。
  */
+import type { LoggerLike } from './log-file';
 export declare const packageRoot: string;
 export declare const defaultHelperMain: string;
 /** 协议行前缀：stdout/stdin 里以此开头的整行 JSON 属于 bridge 协议，其余为日志 */
@@ -97,6 +98,23 @@ export interface EnsureElectronOptions {
     mirror?: string;
     /** 单次下载超时（默认 10 分钟）。 */
     timeoutMs?: number;
+    /**
+     * 面向用户的日志出口（进桌宠工作气泡）。
+     * **与 console 分开**：console 留英文原文给终端 / CLI 排障，这里产出给「没有控制台的
+     * DSH 桌面版用户」看的一句短话。宿主负责截断与投递，本函数只产出文本——它不认识 state。
+     */
+    onLog?: (event: ElectronDownloadLog) => void;
+    /**
+     * 落盘日志出口（宿主注入的统一日志器，见 ./log-file）。
+     * 不传则退回 console：CLI / 单测里仍能直接在终端看到。
+     */
+    logger?: LoggerLike;
+}
+/** 一条下载日志：`text` 给用户看；`level='warn'` = 失败路径；`done` = 本次下载已收尾（成功或失败） */
+export interface ElectronDownloadLog {
+    text: string;
+    level: 'info' | 'warn';
+    done: boolean;
 }
 /**
  * 进程内下载并解压 Electron 到 $DSH_HOME/electron。

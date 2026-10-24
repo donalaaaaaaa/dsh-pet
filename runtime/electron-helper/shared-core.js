@@ -12,6 +12,7 @@ const HIT_BOX = {
 	y1: 335
 };
 const DRAG_THRESHOLD = 5;
+const SLINGSHOT_DOUBLE_MS = 200;
 const PET_REF_WIDTH = 462;
 const ANIMATION_EXT = ".webm";
 
@@ -217,7 +218,132 @@ const anchorPixel = (o) => {
 };
 
 //#endregion
-//#region src/shared/balance.ts
+//#region src/shared/balance/tone.ts
+const QUOTA_WARN_PERCENT = 70;
+const QUOTA_CRIT_PERCENT = 90;
+function quotaTone(percent) {
+	if (percent >= QUOTA_CRIT_PERCENT) return "crit";
+	if (percent >= QUOTA_WARN_PERCENT) return "warn";
+	return "ok";
+}
+
+//#endregion
+//#region src/shared/balance/parse.ts
+const CUSTOM_TAGS = [
+	"div",
+	"span",
+	"i",
+	"b",
+	"strong",
+	"em",
+	"img"
+];
+const CUSTOM_STYLE_KEYS = new Set([
+	"display",
+	"flex",
+	"flexDirection",
+	"flexWrap",
+	"alignItems",
+	"justifyContent",
+	"gap",
+	"margin",
+	"marginTop",
+	"marginRight",
+	"marginBottom",
+	"marginLeft",
+	"padding",
+	"paddingTop",
+	"paddingRight",
+	"paddingBottom",
+	"paddingLeft",
+	"width",
+	"height",
+	"minWidth",
+	"maxWidth",
+	"minHeight",
+	"maxHeight",
+	"color",
+	"fontSize",
+	"fontWeight",
+	"fontStyle",
+	"lineHeight",
+	"letterSpacing",
+	"textAlign",
+	"textDecoration",
+	"whiteSpace",
+	"verticalAlign",
+	"fontVariantNumeric",
+	"background",
+	"backgroundColor",
+	"border",
+	"borderTop",
+	"borderBottom",
+	"borderLeft",
+	"borderRight",
+	"borderRadius",
+	"overflow",
+	"opacity"
+]);
+/** 样式值里一律禁止的片段：外部资源、表达式、注释截断。要图请用 `img` 节点（地址另有限制）。 */
+const BANNED_STYLE_VALUE = /url\(|expression|javascript:|vbscript:|@import|\\|\/\*/i;
+const CUSTOM_LIMITS = {
+	maxDepth: 6,
+	maxNodes: 200,
+	maxChildren: 24,
+	maxText: 120,
+	maxStyleValue: 64,
+	maxSrc: 512,
+	maxViews: 4
+};
+/**
+* 递归解析/校验一个节点（外部输入 → 视图树）。
+*
+* 失败策略：**任一节点不合法 → 整棵树返回 null**。部分渲染会得到一棵"缺了一块"的气泡，
+* 比这一拍不显示更容易误导人；而样式的单个属性非法只丢那一条（不值得为此整树作废）。
+*
+* @param depth 当前深度（根 = 0）
+* @param budget 全树节点计数（跨递归共享）
+* @returns 合法节点；不合法返回 null（调用方据此整拍跳过）
+*/
+function parseCustomNode(raw, depth, budget) {
+	if (!raw || typeof raw !== "object") return null;
+	if (depth >= CUSTOM_LIMITS.maxDepth) return null;
+	budget.nodes += 1;
+	if (budget.nodes > CUSTOM_LIMITS.maxNodes) return null;
+	const n = raw;
+	const tag = typeof n.tag === "string" ? n.tag : "";
+	if (!CUSTOM_TAGS.includes(tag)) return null;
+	const node = { tag };
+	if (typeof n.text === "string" && n.text.length > 0) node.text = n.text.slice(0, CUSTOM_LIMITS.maxText);
+	if (tag === "img") {
+		const src = typeof n.src === "string" ? n.src.trim() : "";
+		if (!/^https?:\/\//i.test(src) || src.length > CUSTOM_LIMITS.maxSrc) return null;
+		node.src = src;
+	}
+	if (n.style && typeof n.style === "object" && !Array.isArray(n.style)) {
+		const style = {};
+		for (const [k, v] of Object.entries(n.style)) {
+			if (!CUSTOM_STYLE_KEYS.has(k)) continue;
+			if (typeof v !== "string") continue;
+			const value = v.trim();
+			if (value === "" || value.length > CUSTOM_LIMITS.maxStyleValue) continue;
+			if (BANNED_STYLE_VALUE.test(value)) continue;
+			style[k] = value;
+		}
+		if (Object.keys(style).length > 0) node.style = style;
+	}
+	if (Array.isArray(n.children)) {
+		if (n.children.length > CUSTOM_LIMITS.maxChildren) return null;
+		const children = [];
+		for (const child of n.children) {
+			const parsed = parseCustomNode(child, depth + 1, budget);
+			if (parsed === null) return null;
+			children.push(parsed);
+		}
+		if (children.length > 0) node.children = children;
+	}
+	return node;
+}
 /**
 * 可选数字：缺省 → undefined；出现但非法 → null（调用方据此整拍跳过——不把 NaN/字符串送进展示层）。
 */
@@ -266,35 +392,176 @@ function toBalanceState(raw) {
 			monthlyResetsAt: typeof d.monthlyResetsAt === "string" ? d.monthlyResetsAt : void 0
 		};
 	}
-	if (r.shape === "money") return {
-		provider,
-		shape: "money",
-		ok: true,
-		currency: typeof d.currency === "string" ? d.currency : void 0,
-		total: typeof d.total === "string" ? d.total : void 0,
-		granted: typeof d.granted === "string" ? d.granted : void 0,
-		toppedUp: typeof d.toppedUp === "string" ? d.toppedUp : void 0,
-		fullBalance: typeof d.fullBalance === "string" ? d.fullBalance : void 0,
-		tier: d.tier === "peak" || d.tier === "idle" ? d.tier : void 0
-	};
+	if (r.shape === "money") {
+		const raw$1 = Array.isArray(d.wallets) ? d.wallets : [];
+		const wallets = [];
+		for (const item of raw$1) {
+			if (!item || typeof item !== "object") continue;
+			const w = item;
+			if (typeof w.currency !== "string" || w.currency.length === 0) continue;
+			if (typeof w.total !== "string" || w.total.length === 0) continue;
+			wallets.push({
+				currency: w.currency,
+				total: w.total,
+				granted: typeof w.granted === "string" && w.granted.length > 0 ? w.granted : "0.00",
+				toppedUp: typeof w.toppedUp === "string" && w.toppedUp.length > 0 ? w.toppedUp : "0.00",
+				fullBalance: typeof w.fullBalance === "string" && w.fullBalance.length > 0 ? w.fullBalance : void 0
+			});
+		}
+		if (wallets.length === 0) return null;
+		return {
+			provider,
+			shape: "money",
+			ok: true,
+			wallets,
+			tier: d.tier === "peak" || d.tier === "idle" ? d.tier : void 0
+		};
+	}
+	if (r.shape === "points") {
+		if (typeof d.unit !== "string" || d.unit.length === 0) return null;
+		if (typeof d.total !== "string" || d.total.length === 0) return null;
+		return {
+			provider,
+			shape: "points",
+			ok: true,
+			points: {
+				unit: d.unit,
+				total: d.total,
+				full: typeof d.full === "string" && d.full.length > 0 ? d.full : void 0
+			}
+		};
+	}
+	if (r.shape === "custom") {
+		let views = [];
+		if (Array.isArray(d.views) && d.views.length > 0) {
+			if (d.views.length > CUSTOM_LIMITS.maxViews) return null;
+			for (const raw$1 of d.views) {
+				const page = parseCustomNode(raw$1, 0, { nodes: 0 });
+				if (!page) return null;
+				views.push(page);
+			}
+		} else {
+			const rows = parseCustomNode(d.rows, 0, { nodes: 0 });
+			if (!rows) return null;
+			views = [rows];
+			if (d.detailRows !== void 0) {
+				const detail = parseCustomNode(d.detailRows, 0, { nodes: 0 });
+				if (!detail) return null;
+				views.push(detail);
+			}
+		}
+		const pct = typeof d.percent === "number" && Number.isFinite(d.percent) ? Math.max(0, Math.min(100, d.percent)) : void 0;
+		return {
+			provider,
+			shape: "custom",
+			ok: true,
+			custom: {
+				views,
+				percent: pct
+			}
+		};
+	}
 	return null;
 }
-function balancePercent(v) {
-	if (v.shape === "money") {
-		const total = Number(v.total);
-		const full = Number(v.fullBalance);
-		if (!Number.isFinite(total)) return void 0;
-		if (!Number.isFinite(full) || full <= 0) return void 0;
-		const remaining = Math.max(0, total) / full * 100;
-		return Math.max(0, Math.min(100, 100 - remaining));
+
+//#endregion
+//#region src/shared/balance/handlers/custom.ts
+const customHandler = {
+	percent: (v) => v.custom?.percent,
+	rows: () => [],
+	detail: () => [],
+	views: (v) => v.custom?.views
+};
+
+//#endregion
+//#region src/shared/balance/handlers/money.ts
+/**
+* money：各币种按**自己的基准**（`fullBalance`）算「剩余比例」，再相加折算成已用百分比。
+* 没有基准的币种跳过（不参与折算，不替它猜一个）；一个带基准的都没有 → undefined（不播档位）。
+*/
+function moneyPercent(v) {
+	let remaining = 0;
+	let based = 0;
+	for (const w of v.wallets ?? []) {
+		const total = Number(w.total);
+		const full = Number(w.fullBalance);
+		if (!Number.isFinite(total) || !Number.isFinite(full) || full <= 0) continue;
+		remaining += total / full;
+		based++;
 	}
-	return Math.max(v.rolling ?? 0, v.weekly ?? 0, v.monthly ?? 0);
+	if (based === 0) return void 0;
+	return Math.max(0, Math.min(100, 100 - remaining * 100));
 }
-function balanceEventIndex(p) {
-	if (p === 100) return 5;
-	const i = Math.floor(p / 20);
-	return i < 5 ? i : 4;
+/**
+* money：一行「余额（峰/谷）¥x.xx」。
+*
+* 只显示 `total !== 0` 的币种（**负数要显示**——透支是真的欠钱；正好 0 的不占地方），
+* CNY 优先，用符号拼、`/` 分隔；全都为 0 时兜底显示主币种 ¥0.00（否则气泡会空一行）。
+* 档位装饰（峰/谷）只有提供该计价规则的服务商才有；没有就不加括号那一段。
+*/
+function moneyRows(v) {
+	const visible = (v.wallets ?? []).filter((w) => Number(w.total) !== 0).sort((a, b) => (a.currency === "CNY" ? 0 : 1) - (b.currency === "CNY" ? 0 : 1));
+	const amount = visible.length > 0 ? visible.map((w) => (w.currency === "USD" ? "$" : "¥") + w.total).join("/") : "¥0.00";
+	if (!v.tier) return [{
+		role: "label",
+		text: "余额 " + amount
+	}];
+	return [
+		{
+			role: "label",
+			text: "余额（"
+		},
+		{
+			role: "tier",
+			tier: v.tier,
+			text: v.tier === "peak" ? "峰" : "谷"
+		},
+		{
+			role: "label",
+			text: "）" + amount
+		}
+	];
 }
+const moneyHandler = {
+	percent: moneyPercent,
+	rows: moneyRows
+};
+
+//#endregion
+//#region src/shared/balance/handlers/points.ts
+/**
+* points：与 money 同一套「按基准折算」的数学，数据来自 `points` 而非 `wallets`。
+* 没有基准 / 基准非法 → undefined（不播档位，不替服务商猜一个）。
+*/
+function pointsPercent(v) {
+	const total = Number(v.points?.total);
+	const full = Number(v.points?.full);
+	if (!Number.isFinite(total) || !Number.isFinite(full) || full <= 0) return void 0;
+	return Math.max(0, Math.min(100, 100 - total / full * 100));
+}
+/**
+* points：一行「余额 800 积分」。
+* 单位是数据带出的后缀，**绝不套货币符号**（`currency` 那套 $/¥ 判断只属于 money）。
+* 0 也照常显示：0 积分是真实读数。
+*/
+function pointsRows(v) {
+	const p = v.points;
+	if (!p) return [{
+		role: "label",
+		text: "积分数据不可用"
+	}];
+	return [{
+		role: "label",
+		text: "余额 " + p.total + " " + p.unit
+	}];
+}
+const pointsHandler = {
+	percent: pointsPercent,
+	rows: pointsRows
+};
+
+//#endregion
+//#region src/shared/balance/handlers/windows.ts
 const WINDOW_LABELS = {
 	weekly: "周",
 	monthly: "月"
@@ -314,7 +581,7 @@ function windowQuotas(v) {
 	};
 }
 function urgentWindow(v) {
-	if (v.shape === "money") return void 0;
+	if (v.shape !== "windows") return void 0;
 	const quotas = windowQuotas(v);
 	const resets = {
 		rolling: v.rollingResetsAt,
@@ -361,6 +628,87 @@ function resetInText(iso) {
 	if (hoursF >= 96) return (Math.round(hoursF / 24 * 10) / 10).toFixed(1) + " 天";
 	return Math.max(.1, Math.round(hoursF * 10) / 10).toFixed(1) + " 小时";
 }
+/** windows：三窗口取最大（只有月窗口时就是它自己） */
+function windowsPercent(v) {
+	return Math.max(v.rolling ?? 0, v.weekly ?? 0, v.monthly ?? 0);
+}
+/** windows：两行 —— 最紧迫窗口的「已用 N%」+ 重置倒计时 */
+function windowsRows(v) {
+	const w = urgentWindow(v);
+	if (!w) return [{
+		role: "label",
+		text: "额度数据不可用"
+	}];
+	const reset = resetInText(w.resetsAt);
+	return [{
+		role: "label",
+		text: w.label + "额度已用 " + Math.round(w.percent) + "%"
+	}, {
+		role: "sub",
+		text: reset ? reset + "重置" : "已重置"
+	}];
+}
+/**
+* windows：展开态每个存在窗口一行 —— 窗口名 + 进度条 + 已用百分比 + 重置倒计时。
+* 只列**存在**的窗口：`rolling` / `weekly` 缺省 = 该服务商没有这个窗口，不补 0、不画空条。
+*/
+function windowsDetail(v) {
+	const resets = {
+		rolling: v.rollingResetsAt,
+		weekly: v.weeklyResetsAt,
+		monthly: v.monthlyResetsAt
+	};
+	const rows = [];
+	for (const w of [
+		"rolling",
+		"weekly",
+		"monthly"
+	]) {
+		const percent = v[w];
+		if (percent === void 0) continue;
+		const reset = resetInText(resets[w]);
+		const usedText = Math.round(percent) + "%";
+		const resetText = reset === "" ? "已重置" : reset + "重置";
+		rows.push({
+			role: "quota",
+			text: windowLabel(v, w) + " " + usedText + " " + resetText,
+			label: windowLabel(v, w),
+			percent,
+			tone: quotaTone(percent),
+			usedText,
+			resetText
+		});
+	}
+	return rows.length > 0 ? rows : windowsRows(v);
+}
+const windowsHandler = {
+	percent: windowsPercent,
+	rows: windowsRows,
+	detail: windowsDetail
+};
+
+//#endregion
+//#region src/shared/balance/handlers/index.ts
+const HANDLERS = {
+	windows: windowsHandler,
+	money: moneyHandler,
+	points: pointsHandler,
+	custom: customHandler
+};
+
+//#endregion
+//#region src/shared/balance/percent.ts
+function balancePercent(v) {
+	return HANDLERS[v.shape].percent(v);
+}
+function balanceEventIndex(p) {
+	if (p === 100) return 5;
+	const i = Math.floor(p / 20);
+	return i < 5 ? i : 4;
+}
+
+//#endregion
+//#region src/shared/balance/view.ts
 /** 不可用状态的气泡行（显式说明原因，绝不伪造数字）：
 *  - unsupported：服务商未登记查询接口（配置事实，不是故障）→ 报出 provider id，便于自查"当前到底是谁"
 *  - credential-missing：缺凭证 → 次要行放 host 报的凭证名（不含 message 时不留空行）
@@ -386,52 +734,28 @@ function unavailableRows(state) {
 		role: "sub",
 		text: state.message ?? ""
 	}];
-	return rows.filter((r) => r.text !== "");
+	return rows.filter((r) => r.role !== "quota" && r.text !== "");
 }
 function balanceBubbleView(state) {
-	if (state.ok) {
-		if (state.shape !== "money") {
-			const w = urgentWindow(state);
-			if (w) {
-				const reset = resetInText(w.resetsAt);
-				const rows = [{
-					role: "label",
-					text: w.label + "额度已用 " + Math.round(w.percent) + "%"
-				}, {
-					role: "sub",
-					text: reset ? reset + "重置" : "已重置"
-				}];
-				return rows;
-			}
-			return [{
-				role: "label",
-				text: "额度数据不可用"
-			}];
-		}
-		const symbol = state.currency === "USD" ? "$" : "¥";
-		const amount = symbol + (state.total ?? "-");
-		if (!state.tier) return [{
-			role: "label",
-			text: "余额 " + amount
-		}];
-		return [
-			{
-				role: "label",
-				text: "余额（"
-			},
-			{
-				role: "tier",
-				tier: state.tier,
-				text: state.tier === "peak" ? "峰" : "谷"
-			},
-			{
-				role: "label",
-				text: "）" + amount
-			}
-		];
-	}
-	return unavailableRows(state);
+	if (!state.ok) return unavailableRows(state);
+	return HANDLERS[state.shape].rows(state);
 }
+function balanceDetailView(state) {
+	if (!state.ok) return unavailableRows(state);
+	const handler = HANDLERS[state.shape];
+	return handler.detail ? handler.detail(state) : handler.rows(state);
+}
+function customViews(state) {
+	if (!state.ok || state.shape !== "custom") return void 0;
+	const views = HANDLERS[state.shape].views?.(state);
+	return views && views.length > 0 ? views : void 0;
+}
+function customClickable(state) {
+	return (customViews(state)?.length ?? 0) > 1;
+}
+
+//#endregion
+//#region src/shared/balance/notice.ts
 function decideBalanceNotice(state, lastKey, explicit) {
 	if (state.ok) return {
 		show: false,
@@ -485,6 +809,16 @@ function createMemeImage(name, base = "/dsh-pet-7340", assetRoot = "") {
 	img.className = MEME_IMG_CLASS;
 	img.src = memeImageUrl(key, base, assetRoot);
 	img.alt = key;
+	return img;
+}
+function createMemeImageFromUrl(url) {
+	const href = String(url ?? "").trim();
+	if (!href) return null;
+	injectMemeBubbleCss();
+	const img = document.createElement("img");
+	img.className = MEME_IMG_CLASS;
+	img.src = href;
+	img.alt = "";
 	return img;
 }
 
@@ -686,6 +1020,53 @@ const displayMenuBranch = () => ({
 		}
 	]
 });
+const MORE_MENU_LABEL = "更多";
+function readMenuItems(data, surface) {
+	if (!data || typeof data !== "object") return [];
+	const items = data.items;
+	if (!Array.isArray(items)) return [];
+	const out = [];
+	for (const item of items) {
+		if (!item || typeof item !== "object") continue;
+		const rec = item;
+		const rawTarget = rec.target;
+		const target = rawTarget === "web" || rawTarget === "desktop" || rawTarget === "both" ? rawTarget : "both";
+		if (target !== "both" && target !== surface) continue;
+		const owner = rec.owner;
+		const label = rec.label;
+		if (typeof owner === "string" && owner !== "" && typeof label === "string" && label !== "") out.push({
+			owner,
+			label
+		});
+	}
+	return out;
+}
+function buildMoreBranch(items) {
+	const groups = new Map();
+	for (const item of items) {
+		const list = groups.get(item.owner);
+		if (list) list.push(item.label);
+		else groups.set(item.owner, [item.label]);
+	}
+	const children = [];
+	for (const [owner, labels] of groups) if (labels.length === 1) children.push({
+		label: labels[0],
+		action: "third-party",
+		owner
+	});
+	else children.push({
+		label: owner,
+		children: labels.map((label) => ({
+			label,
+			action: "third-party",
+			owner
+		}))
+	});
+	return children.length > 0 ? {
+		label: MORE_MENU_LABEL,
+		children
+	} : null;
+}
 /** 事件名 → 分类标签（无映射时用事件名本身） */
 const EVENT_LABELS = {
 	balance: "余额档位",
@@ -738,7 +1119,7 @@ const MENU_CSS = [
 	".dsh-pet-menu{position:fixed;left:0;top:0;z-index:2147483000;color:#2b2b2b;font-size:13px;line-height:1.5;",
 	"font-family:'Microsoft YaHei UI','Segoe UI','PingFang SC',sans-serif;user-select:none;pointer-events:auto}",
 	".dsh-pet-menu,.dsh-pet-menu *{box-sizing:border-box}",
-	".dsh-pet-menu-column{position:absolute;min-width:150px;max-width:240px;padding:4px;",
+	".dsh-pet-menu-column{position:absolute;min-width:150px;max-width:300px;padding:4px;",
 	"background:rgba(255,255,255,.98);border:1px solid rgba(0,0,0,.12);border-radius:8px;",
 	"box-shadow:0 8px 28px rgba(0,0,0,.2);max-height:min(62vh,460px);overflow-y:auto;",
 	"scrollbar-width:thin;scrollbar-color:rgba(0,0,0,.22) transparent}",
@@ -753,6 +1134,7 @@ const MENU_CSS = [
 	"gap:14px;padding:5px 12px;border-radius:6px;white-space:nowrap;cursor:default}",
 	".dsh-pet-menu-item:hover{background:rgba(43,99,255,.14)}",
 	".dsh-pet-menu-item>span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis}",
+	".dsh-pet-menu-hint{color:#9aa0a6;font-size:12px;flex:none;white-space:nowrap}",
 	".dsh-pet-menu-arrow{color:#9aa0a6;font-size:12px;flex:none}"
 ].join("");
 function isBranchNode(n) {
@@ -830,6 +1212,12 @@ function mountContextMenu(opts) {
 				const label = document.createElement("span");
 				label.textContent = node.label;
 				item.appendChild(label);
+				if (node.hint) {
+					const hint = document.createElement("span");
+					hint.className = "dsh-pet-menu-hint";
+					hint.textContent = node.hint;
+					item.appendChild(hint);
+				}
 				item.addEventListener("click", (e) => {
 					e.preventDefault();
 					e.stopPropagation();
@@ -940,9 +1328,9 @@ function injectChatCss() {
 }
 function mountChatDialog(opts) {
 	injectChatCss();
-	const { petId, x, y, onSent, onClose, clamp } = opts;
+	const { petId, surface, x, y, onSent, onClose, clamp } = opts;
 	const baseUrl = opts.baseUrl ?? "/dsh-pet-7340/chat";
-	const withPet = baseUrl + "?pet=" + encodeURIComponent(petId);
+	const withPet = baseUrl + "?pet=" + encodeURIComponent(petId) + "&surface=" + surface;
 	const c = clamp && Number.isFinite(clamp.x + clamp.y + clamp.w + clamp.h) ? clamp : {
 		x: 0,
 		y: 0,
@@ -1129,6 +1517,35 @@ const softClampSpeed = (speed) => {
 	if (speed <= 0) return 0;
 	return MAX_THROW_SPEED * (1 - Math.exp(-speed / MAX_THROW_SPEED));
 };
+const THROW_SPEED_ANCHOR = 1200;
+const throwVelocity = (angleDeg, power) => {
+	const speed = softClampSpeed(power * THROW_SPEED_ANCHOR);
+	const rad = angleDeg * Math.PI / 180;
+	return {
+		vx: Math.cos(rad) * speed,
+		vy: -Math.sin(rad) * speed
+	};
+};
+const SLINGSHOT_REF_RATIO = .6;
+const slingshotRefDist = (size) => size > 0 ? size * SLINGSHOT_REF_RATIO : 0;
+const slingshotPower = (dist, size) => {
+	const ref = slingshotRefDist(size);
+	if (!(ref > 0) || !(dist > 0) || !Number.isFinite(dist)) return 0;
+	return dist / ref;
+};
+const pullAngle = (pullX, pullY) => Math.atan2(pullY, -pullX) * 180 / Math.PI;
+const slingshotVelocity = (angleDeg, power, throwPower = DEFAULT_THROW_POWER) => {
+	const speed = THROW_SPEED_ANCHOR * Math.max(0, power) * Math.max(0, throwPower);
+	if (speed === 0) return {
+		vx: 0,
+		vy: 0
+	};
+	const rad = angleDeg * Math.PI / 180;
+	return {
+		vx: Math.cos(rad) * speed,
+		vy: -Math.sin(rad) * speed
+	};
+};
 const estimateReleaseVelocity = (trail, now, physics = DEFAULT_PHYSICS) => {
 	if (trail.length === 0) return null;
 	const last = trail[trail.length - 1];
@@ -1289,6 +1706,13 @@ const throwStepRegion = (s, dtRaw, space, physics = DEFAULT_PHYSICS, lockScreen 
 		bounced,
 		atRest
 	};
+};
+const SUBSTEP_PX = 8;
+const SUBSTEP_MAX = 64;
+const throwSubsteps = (vx, vy, dt) => {
+	const travel = Math.hypot(vx, vy) * Math.min(Math.max(dt, 0), MAX_STEP_DT);
+	if (!(travel > SUBSTEP_PX)) return 1;
+	return Math.min(SUBSTEP_MAX, Math.ceil(travel / SUBSTEP_PX));
 };
 const PET_BOUNCE_E = .995;
 const bodyPixelBox = (o) => {
@@ -1525,9 +1949,10 @@ function normLeaf(value) {
 		data: leaf$1.data ?? null
 	};
 }
-async function fetchState(baseUrl = "/dsh-pet-7340/state") {
+async function fetchState(baseUrl = "/dsh-pet-7340/state", wait) {
 	try {
-		const res = await fetch(baseUrl, { cache: "no-store" });
+		const url = wait ? `${baseUrl}?since=${wait.since}&timeout=${wait.timeoutMs}` : baseUrl;
+		const res = await fetch(url, { cache: "no-store" });
 		if (!res.ok) return null;
 		const raw = await res.json().catch(() => null);
 		if (!raw || typeof raw !== "object") return null;
@@ -1549,9 +1974,9 @@ async function fetchState(baseUrl = "/dsh-pet-7340/state") {
 			pets[petId] = leaves;
 		}
 		return {
+			counter: typeof raw.counter === "number" && Number.isFinite(raw.counter) ? raw.counter : void 0,
 			sections,
-			pets,
-			configVersion: typeof raw.configVersion === "string" ? raw.configVersion : void 0
+			pets
 		};
 	} catch {
 		return null;
@@ -1591,10 +2016,15 @@ function readBalance(leaf$1) {
 function readSay(leaf$1) {
 	if (!leaf$1.data || typeof leaf$1.data !== "object") return null;
 	const d = leaf$1.data;
+	if (d.clear === true) return { kind: "clear" };
 	if (typeof d.text !== "string" || !d.text) return null;
 	return {
+		kind: "say",
 		text: d.text,
-		image: typeof d.image === "string" ? d.image : void 0
+		image: typeof d.image === "string" ? d.image : void 0,
+		url: typeof d.url === "string" ? d.url : void 0,
+		duration: typeof d.duration === "number" && Number.isFinite(d.duration) && d.duration >= 0 ? d.duration : void 0,
+		anim: typeof d.anim === "boolean" ? d.anim : void 0
 	};
 }
 function readWorkStatus(leaf$1) {
@@ -1603,8 +2033,58 @@ function readWorkStatus(leaf$1) {
 function readAnim(leaf$1) {
 	if (!leaf$1.data || typeof leaf$1.data !== "object") return null;
 	const d = leaf$1.data;
-	if (typeof d.name !== "string" || !d.name) return null;
-	return { name: d.name };
+	const name = typeof d.name === "string" && d.name ? d.name : void 0;
+	const url = typeof d.url === "string" && d.url ? d.url : void 0;
+	if (name === void 0 && url === void 0) return null;
+	return {
+		name,
+		url,
+		playbackId: typeof d.playbackId === "string" && d.playbackId ? d.playbackId : void 0,
+		facing: d.facing === "left" || d.facing === "right" ? d.facing : void 0
+	};
+}
+function readLock(leaf$1) {
+	if (!leaf$1.data || typeof leaf$1.data !== "object") return null;
+	const d = leaf$1.data;
+	if (d.locked === false) return { locked: false };
+	if (d.locked !== true) return null;
+	if (typeof d.expiresAt !== "number" || !Number.isFinite(d.expiresAt)) return null;
+	return {
+		locked: true,
+		expiresAt: d.expiresAt
+	};
+}
+function readPosition(leaf$1) {
+	if (!leaf$1.data || typeof leaf$1.data !== "object") return null;
+	const d = leaf$1.data;
+	if (typeof d.x !== "number" || !Number.isFinite(d.x)) return null;
+	if (typeof d.y !== "number" || !Number.isFinite(d.y)) return null;
+	if (d.mode !== "instant" && d.mode !== "spring" && d.mode !== "line") return null;
+	if (d.mode === "line") {
+		if (typeof d.duration !== "number" || !Number.isFinite(d.duration) || d.duration < 0) return null;
+		return {
+			x: d.x,
+			y: d.y,
+			mode: "line",
+			duration: d.duration
+		};
+	}
+	return {
+		x: d.x,
+		y: d.y,
+		mode: d.mode,
+		duration: 0
+	};
+}
+function readThrow(leaf$1) {
+	if (!leaf$1.data || typeof leaf$1.data !== "object") return null;
+	const d = leaf$1.data;
+	if (typeof d.angle !== "number" || !Number.isFinite(d.angle)) return null;
+	if (typeof d.power !== "number" || !Number.isFinite(d.power) || d.power <= 0) return null;
+	return {
+		angle: d.angle,
+		power: d.power
+	};
 }
 async function postAction(baseUrl, body) {
 	try {
@@ -1667,6 +2147,9 @@ exports.BUBBLE_METRICS = BUBBLE_METRICS
 exports.BUBBLE_OVERLAP_RATIO = BUBBLE_OVERLAP_RATIO
 exports.CANVAS_H = CANVAS_H
 exports.CHAT_CSS = CHAT_CSS
+exports.CUSTOM_LIMITS = CUSTOM_LIMITS
+exports.CUSTOM_STYLE_KEYS = CUSTOM_STYLE_KEYS
+exports.CUSTOM_TAGS = CUSTOM_TAGS
 exports.DEAD_ZONE_SPEED = DEAD_ZONE_SPEED
 exports.DEFAULT_FONT = DEFAULT_FONT
 exports.DEFAULT_PHYSICS = DEFAULT_PHYSICS
@@ -1680,6 +2163,7 @@ exports.FONT_SIZE_MAX = FONT_SIZE_MAX
 exports.FONT_SIZE_MIN = FONT_SIZE_MIN
 exports.GRAVITY = GRAVITY
 exports.GROUND_FRICTION = GROUND_FRICTION
+exports.HANDLERS = HANDLERS
 exports.HIT_BOX = HIT_BOX
 exports.MAX_BODY = MAX_BODY
 exports.MAX_DESKTOP_PETS = MAX_DESKTOP_PETS
@@ -1690,11 +2174,14 @@ exports.MEME_BUBBLE_CSS = MEME_BUBBLE_CSS
 exports.MEME_IMG_CLASS = MEME_IMG_CLASS
 exports.MENU_CSS = MENU_CSS
 exports.MIN_SPAN_MS = MIN_SPAN_MS
+exports.MORE_MENU_LABEL = MORE_MENU_LABEL
 exports.NOTIFY_ICONS = NOTIFY_ICONS
 exports.PEAK_WEIGHT = PEAK_WEIGHT
 exports.PET_BOUNCE_E = PET_BOUNCE_E
 exports.PET_DISPLAYS = PET_DISPLAYS
 exports.PET_REF_WIDTH = PET_REF_WIDTH
+exports.QUOTA_CRIT_PERCENT = QUOTA_CRIT_PERCENT
+exports.QUOTA_WARN_PERCENT = QUOTA_WARN_PERCENT
 exports.RELEASE_STALE_MS = RELEASE_STALE_MS
 exports.RELEASE_WINDOW_MS = RELEASE_WINDOW_MS
 exports.RESTITUTION = RESTITUTION
@@ -1704,6 +2191,8 @@ exports.SCORE_MIN_SPEED = SCORE_MIN_SPEED
 exports.SCORE_POPUP_CSS = SCORE_POPUP_CSS
 exports.SCORE_POPUP_DURATION_MS = SCORE_POPUP_DURATION_MS
 exports.SEG_MIN_DT_MS = SEG_MIN_DT_MS
+exports.SLINGSHOT_DOUBLE_MS = SLINGSHOT_DOUBLE_MS
+exports.SLINGSHOT_REF_RATIO = SLINGSHOT_REF_RATIO
 exports.SPRING_C = SPRING_C
 exports.SPRING_K = SPRING_K
 exports.SQ_DURATION_MS = SQ_DURATION_MS
@@ -1711,6 +2200,9 @@ exports.SQ_HARD_SPEED = SQ_HARD_SPEED
 exports.SQ_MAX_SQUASH = SQ_MAX_SQUASH
 exports.SQ_SOFT_SPEED = SQ_SOFT_SPEED
 exports.SQ_SQUASH = SQ_SQUASH
+exports.SUBSTEP_MAX = SUBSTEP_MAX
+exports.SUBSTEP_PX = SUBSTEP_PX
+exports.THROW_SPEED_ANCHOR = THROW_SPEED_ANCHOR
 exports.TIP_FONT_BASE_PX = TIP_FONT_BASE_PX
 exports.TOOLTIP_CLASS = TOOLTIP_CLASS
 exports.TOOLTIP_CSS = TOOLTIP_CSS
@@ -1721,6 +2213,7 @@ exports.WORK_STATUS_INDEX = WORK_STATUS_INDEX
 exports.WORK_STATUS_STATES = WORK_STATUS_STATES
 exports.anchorPixel = anchorPixel
 exports.balanceBubbleView = balanceBubbleView
+exports.balanceDetailView = balanceDetailView
 exports.balanceEventIndex = balanceEventIndex
 exports.balancePercent = balancePercent
 exports.bodyPixelBox = bodyPixelBox
@@ -1728,11 +2221,15 @@ exports.boundingRect = boundingRect
 exports.bubbleMaxHeightPx = bubbleMaxHeightPx
 exports.bubbleTopMarginPx = bubbleTopMarginPx
 exports.buildMenuTree = buildMenuTree
+exports.buildMoreBranch = buildMoreBranch
 exports.clampPointInRect = clampPointInRect
 exports.clampPointToRegion = clampPointToRegion
 exports.clickScore = clickScore
 exports.collidePet = collidePet
 exports.createMemeImage = createMemeImage
+exports.createMemeImageFromUrl = createMemeImageFromUrl
+exports.customClickable = customClickable
+exports.customViews = customViews
 exports.decideBalanceNotice = decideBalanceNotice
 exports.displayMenuBranch = displayMenuBranch
 exports.distToRectSq = distToRectSq
@@ -1763,10 +2260,16 @@ exports.planMove = planMove
 exports.pointInRect = pointInRect
 exports.poolIncludes = poolIncludes
 exports.postAction = postAction
+exports.pullAngle = pullAngle
+exports.quotaTone = quotaTone
 exports.randomBetween = randomBetween
 exports.readAnim = readAnim
 exports.readBalance = readBalance
+exports.readLock = readLock
+exports.readMenuItems = readMenuItems
+exports.readPosition = readPosition
 exports.readSay = readSay
+exports.readThrow = readThrow
 exports.readWorkStatus = readWorkStatus
 exports.rectAtPoint = rectAtPoint
 exports.rectBottom = rectBottom
@@ -1780,7 +2283,11 @@ exports.resolveRect = resolveRect
 exports.rollKind = rollKind
 exports.screenOfBox = screenOfBox
 exports.sendChat = sendChat
+exports.slingshotPower = slingshotPower
+exports.slingshotRefDist = slingshotRefDist
+exports.slingshotVelocity = slingshotVelocity
 exports.slotIncludes = slotIncludes
+exports.softClampSpeed = softClampSpeed
 exports.spawnScoreBurst = spawnScoreBurst
 exports.springStep = springStep
 exports.squashScale = squashScale
@@ -1790,6 +2297,8 @@ exports.throwBoundsIn = throwBoundsIn
 exports.throwSpace = throwSpace
 exports.throwStep = throwStep
 exports.throwStepRegion = throwStepRegion
+exports.throwSubsteps = throwSubsteps
+exports.throwVelocity = throwVelocity
 exports.toBalanceState = toBalanceState
 exports.toWorkStatus = toWorkStatus
 exports.tooltipPlacement = tooltipPlacement
@@ -1798,5 +2307,6 @@ exports.trimTrail = trimTrail
 exports.truncate = truncate
 exports.urgentWindow = urgentWindow
 exports.whisperBubbleView = whisperBubbleView
+exports.windowsHandler = windowsHandler
 return exports;
 })({});
